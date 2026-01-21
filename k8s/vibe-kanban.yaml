@@ -133,58 +133,8 @@ spec:
                 secretKeyRef:
                   name: vibe-kanban-secrets
                   key: GOOGLE_OAUTH_CLIENT_SECRET
-            - name: LOOPS_EMAIL_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: vibe-kanban-secrets
-                  key: LOOPS_EMAIL_API_KEY
-            # Optional R2/S3
-            - name: R2_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: vibe-kanban-secrets
-                  key: R2_ACCESS_KEY_ID
-            - name: R2_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: vibe-kanban-secrets
-                  key: R2_SECRET_ACCESS_KEY
-            - name: R2_REVIEW_ENDPOINT
-              valueFrom:
-                secretKeyRef:
-                  name: vibe-kanban-secrets
-                  key: R2_REVIEW_ENDPOINT
-            - name: R2_REVIEW_BUCKET
-              valueFrom:
-                secretKeyRef:
-                  name: vibe-kanban-secrets
-                  key: R2_REVIEW_BUCKET
-            - name: REVIEW_WORKER_BASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: vibe-kanban-secrets
-                  key: REVIEW_WORKER_BASE_URL
-            # Optional GitHub App
-            - name: GITHUB_APP_ID
-              valueFrom:
-                secretKeyRef:
-                  name: vibe-kanban-secrets
-                  key: GITHUB_APP_ID
-            - name: GITHUB_APP_PRIVATE_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: vibe-kanban-secrets
-                  key: GITHUB_APP_PRIVATE_KEY
-            - name: GITHUB_APP_WEBHOOK_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: vibe-kanban-secrets
-                  key: GITHUB_APP_WEBHOOK_SECRET
-            - name: GITHUB_APP_SLUG
-              valueFrom:
-                secretKeyRef:
-                  name: vibe-kanban-secrets
-                  key: GITHUB_APP_SLUG
+            # Optional: R2/S3 and GitHub App env vars removed
+            # Add them back when you have valid values in the secret
           readinessProbe:
             httpGet:
               path: /health

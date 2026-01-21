@@ -1,9 +1,21 @@
-CREATE ROLE electric_sync WITH LOGIN REPLICATION;
+-- Create role if not exists
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'electric_sync') THEN
+        CREATE ROLE electric_sync WITH LOGIN REPLICATION;
+    END IF;
+END $$;
 
 GRANT CONNECT ON DATABASE remote TO electric_sync;
 GRANT USAGE ON SCHEMA public TO electric_sync;
 
-CREATE PUBLICATION electric_publication_default;
+-- Create publication if not exists
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_publication WHERE pubname = 'electric_publication_default') THEN
+        CREATE PUBLICATION electric_publication_default;
+    END IF;
+END $$;
 
 CREATE OR REPLACE FUNCTION electric_sync_table(p_schema text, p_table text)
 RETURNS void
