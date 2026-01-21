@@ -22,6 +22,7 @@ FROM rust:1.89-slim-bookworm AS builder
 ARG APP_NAME
 
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+ENV RUST_MIN_STACK=16777216
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates \

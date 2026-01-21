@@ -1,0 +1,208 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vibe-kanban-config
+  namespace: vibe
+data:
+  SERVER_LISTEN_ADDR: "0.0.0.0:8081"
+  ELECTRIC_URL: "http://electric:3000"
+  # Update these URLs to your actual domain
+  SERVER_PUBLIC_BASE_URL: "http://localhost:8081"
+  VITE_APP_BASE_URL: "http://localhost:8081"
+  VITE_API_BASE_URL: "http://localhost:8081"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vibe-kanban
+  namespace: vibe
+spec:
+  selector:
+    app: vibe-kanban
+  ports:
+    - port: 8081
+      targetPort: 8081
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vibe-kanban
+  namespace: vibe
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vibe-kanban
+  template:
+    metadata:
+      labels:
+        app: vibe-kanban
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h postgres -p 5432 -U remote; do
+                echo "Waiting for PostgreSQL..."
+                sleep 2
+              done
+              echo "PostgreSQL is ready!"
+        - name: wait-for-electric
+          image: curlimages/curl:latest
+          command:
+            - sh
+            - -c
+            - |
+              until curl -s http://electric:3000/health > /dev/null 2>&1; do
+                echo "Waiting for ElectricSQL..."
+                sleep 2
+              done
+              echo "ElectricSQL is ready!"
+      containers:
+        - name: vibe-kanban
+          image: 310455165573.dkr.ecr.us-west-2.amazonaws.com/vibe-kanban-remote:latest
+          ports:
+            - containerPort: 8081
+          env:
+            # Database
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-secrets
+                  key: POSTGRES_PASSWORD
+            - name: SERVER_DATABASE_URL
+              value: "postgres://remote:$(POSTGRES_PASSWORD)@postgres:5432/remote"
+            # Config
+            - name: SERVER_LISTEN_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: vibe-kanban-config
+                  key: SERVER_LISTEN_ADDR
+            - name: ELECTRIC_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: vibe-kanban-config
+                  key: ELECTRIC_URL
+            - name: SERVER_PUBLIC_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: vibe-kanban-config
+                  key: SERVER_PUBLIC_BASE_URL
+            - name: VITE_APP_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: vibe-kanban-config
+                  key: VITE_APP_BASE_URL
+            - name: VITE_API_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: vibe-kanban-config
+                  key: VITE_API_BASE_URL
+            # Secrets
+            - name: ELECTRIC_ROLE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-secrets
+                  key: ELECTRIC_ROLE_PASSWORD
+            - name: VIBEKANBAN_REMOTE_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-secrets
+                  key: VIBEKANBAN_REMOTE_JWT_SECRET
+            - name: GITHUB_OAUTH_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-secrets
+                  key: GITHUB_OAUTH_CLIENT_ID
+            - name: GITHUB_OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-secrets
+                  key: GITHUB_OAUTH_CLIENT_SECRET
+            - name: GOOGLE_OAUTH_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-secrets
+                  key: GOOGLE_OAUTH_CLIENT_ID
+            - name: GOOGLE_OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-secrets
+                  key: GOOGLE_OAUTH_CLIENT_SECRET
+            - name: LOOPS_EMAIL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-secrets
+                  key: LOOPS_EMAIL_API_KEY
+            # Optional R2/S3
+            - name: R2_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-secrets
+                  key: R2_ACCESS_KEY_ID
+            - name: R2_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-secrets
+                  key: R2_SECRET_ACCESS_KEY
+            - name: R2_REVIEW_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-secrets
+                  key: R2_REVIEW_ENDPOINT
+            - name: R2_REVIEW_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-secrets
+                  key: R2_REVIEW_BUCKET
+            - name: REVIEW_WORKER_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-secrets
+                  key: REVIEW_WORKER_BASE_URL
+            # Optional GitHub App
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-secrets
+                  key: GITHUB_APP_ID
+            - name: GITHUB_APP_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-secrets
+                  key: GITHUB_APP_PRIVATE_KEY
+            - name: GITHUB_APP_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-secrets
+                  key: GITHUB_APP_WEBHOOK_SECRET
+            - name: GITHUB_APP_SLUG
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-secrets
+                  key: GITHUB_APP_SLUG
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+      imagePullSecrets:
+        - name: ecr-registry-secret
