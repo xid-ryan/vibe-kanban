@@ -22,13 +22,12 @@ RUN corepack enable
 COPY pnpm-lock.yaml pnpm-workspace.yaml package.json ./
 COPY frontend/package.json frontend/package.json
 COPY npx-cli/package.json npx-cli/package.json
-COPY shared/package.json shared/package.json
 
 # Install frontend dependencies
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
     pnpm install --filter ./frontend --frozen-lockfile
 
-# Copy frontend source and build
+# Copy frontend source and shared types, then build
 COPY frontend/ frontend/
 COPY shared/ shared/
 
