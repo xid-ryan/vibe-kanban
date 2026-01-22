@@ -50,6 +50,7 @@ RUN apt-get update \
      pkg-config \
      libssl-dev \
      ca-certificates \
+     libclang-dev \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
