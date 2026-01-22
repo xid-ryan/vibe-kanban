@@ -61,6 +61,10 @@ COPY crates crates
 COPY shared shared
 COPY assets assets
 
+# Copy the built frontend from fe-builder stage
+# This is required because rust-embed embeds frontend files at compile time
+COPY --from=fe-builder /repo/frontend/dist /app/frontend/dist
+
 RUN mkdir -p /app/bin
 
 # Build the server binary with caching
