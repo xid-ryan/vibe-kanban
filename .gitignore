@@ -85,3 +85,7 @@ dev_assets
 vibe-kanban-cloud/
 
 .jj
+
+# K8s secrets with actual values (template is tracked, but actual secrets should not be)
+k8s/multiuser/secrets.*.yaml
+k8s/multiuser/secrets-prod.yaml

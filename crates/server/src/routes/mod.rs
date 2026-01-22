@@ -1,7 +1,9 @@
 use axum::{
     Router,
+    middleware as axum_middleware,
     routing::{IntoMakeService, get},
 };
+use db::DeploymentMode;
 use tower_http::validate_request::ValidateRequestHeaderLayer;
 
 use crate::{DeploymentImpl, middleware};
@@ -28,9 +30,10 @@ pub mod tasks;
 pub mod terminal;
 
 pub fn router(deployment: DeploymentImpl) -> IntoMakeService<Router> {
-    // Create routers with different middleware layers
-    let base_routes = Router::new()
-        .route("/health", get(health::health_check))
+    let mode = DeploymentMode::detect();
+
+    // Routes that require authentication in K8s mode
+    let protected_routes = Router::new()
         .merge(config::router())
         .merge(containers::router(&deployment))
         .merge(projects::router(&deployment))
@@ -47,7 +50,27 @@ pub fn router(deployment: DeploymentImpl) -> IntoMakeService<Router> {
         .merge(scratch::router(&deployment))
         .merge(sessions::router(&deployment))
         .merge(terminal::router())
-        .nest("/images", images::routes())
+        .nest("/images", images::routes());
+
+    // Apply auth middleware conditionally based on deployment mode
+    let protected_routes = if mode.is_kubernetes() {
+        tracing::info!(
+            mode = "kubernetes",
+            "Applying authentication middleware to protected routes"
+        );
+        protected_routes.layer(axum_middleware::from_fn(middleware::require_user))
+    } else {
+        tracing::info!(
+            mode = "desktop",
+            "Skipping authentication middleware for desktop mode"
+        );
+        protected_routes
+    };
+
+    // Health check is always public (unprotected)
+    let base_routes = Router::new()
+        .route("/health", get(health::health_check))
+        .merge(protected_routes)
         .layer(ValidateRequestHeaderLayer::custom(
             middleware::validate_origin,
         ))

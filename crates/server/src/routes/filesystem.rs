@@ -9,7 +9,7 @@ use serde::Deserialize;
 use services::services::filesystem::{DirectoryEntry, DirectoryListResponse, FilesystemError};
 use utils::response::ApiResponse;
 
-use crate::{DeploymentImpl, error::ApiError};
+use crate::{DeploymentImpl, error::ApiError, middleware::OptionalUserContext};
 
 #[derive(Debug, Deserialize)]
 pub struct ListDirectoryQuery {
@@ -19,7 +19,18 @@ pub struct ListDirectoryQuery {
 pub async fn list_directory(
     State(deployment): State<DeploymentImpl>,
     Query(query): Query<ListDirectoryQuery>,
+    OptionalUserContext(user_ctx): OptionalUserContext,
 ) -> Result<ResponseJson<ApiResponse<DirectoryListResponse>>, ApiError> {
+    // Log user context for tracing in multi-user mode
+    if let Some(ref ctx) = user_ctx {
+        tracing::debug!(
+            user_id = %ctx.user_id,
+            path = ?query.path,
+            "Listing directory for user"
+        );
+    }
+    // TODO: In K8s mode, validate path is within user's allowed directories
+    let requested_path = query.path.clone();
     match deployment.filesystem().list_directory(query.path).await {
         Ok(response) => Ok(ResponseJson(ApiResponse::success(response))),
         Err(FilesystemError::DirectoryDoesNotExist) => {
@@ -27,6 +38,16 @@ pub async fn list_directory(
         }
         Err(FilesystemError::PathIsNotDirectory) => {
             Ok(ResponseJson(ApiResponse::error("Path is not a directory")))
+        }
+        Err(FilesystemError::Unauthorized(msg)) => {
+            tracing::warn!(
+                action = "unauthorized_filesystem_access",
+                user_id = ?user_ctx.as_ref().map(|u| u.user_id),
+                path = ?requested_path,
+                security_event = true,
+                "Unauthorized filesystem access attempt: {}", msg
+            );
+            Err(ApiError::Unauthorized)
         }
         Err(FilesystemError::Io(e)) => {
             tracing::error!("Failed to read directory: {}", e);
@@ -41,7 +62,17 @@ pub async fn list_directory(
 pub async fn list_git_repos(
     State(deployment): State<DeploymentImpl>,
     Query(query): Query<ListDirectoryQuery>,
+    OptionalUserContext(user_ctx): OptionalUserContext,
 ) -> Result<ResponseJson<ApiResponse<Vec<DirectoryEntry>>>, ApiError> {
+    // Log user context for tracing in multi-user mode
+    if let Some(ref ctx) = user_ctx {
+        tracing::debug!(
+            user_id = %ctx.user_id,
+            path = ?query.path,
+            "Listing git repos for user"
+        );
+    }
+    // TODO: In K8s mode, validate path is within user's allowed directories
     let res = if let Some(ref path) = query.path {
         deployment
             .filesystem()
@@ -60,6 +91,16 @@ pub async fn list_git_repos(
         }
         Err(FilesystemError::PathIsNotDirectory) => {
             Ok(ResponseJson(ApiResponse::error("Path is not a directory")))
+        }
+        Err(FilesystemError::Unauthorized(msg)) => {
+            tracing::warn!(
+                action = "unauthorized_filesystem_access",
+                user_id = ?user_ctx.as_ref().map(|u| u.user_id),
+                path = ?query.path,
+                security_event = true,
+                "Unauthorized filesystem access attempt: {}", msg
+            );
+            Err(ApiError::Unauthorized)
         }
         Err(FilesystemError::Io(e)) => {
             tracing::error!("Failed to read directory: {}", e);

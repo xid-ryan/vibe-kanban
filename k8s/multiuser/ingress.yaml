@@ -1,0 +1,53 @@
+# Ingress for vibe-kanban-desktop multi-user deployment
+# Uses AWS ALB Ingress Controller with TLS termination
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vibe-kanban-desktop-ingress
+  namespace: vibe
+  labels:
+    app: vibe-kanban-desktop
+  annotations:
+    # ALB Ingress Controller annotations
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+
+    # TLS configuration
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/ssl-min-version: TLSv1.2
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-FS-1-2-2019-08
+    # REPLACE with your ACM certificate ARN
+    alb.ingress.kubernetes.io/certificate-arn: ${ACM_CERT_ARN}
+
+    # Health check configuration
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+
+    # WebSocket support - increased idle timeout for long-lived connections
+    # PTY sessions and real-time updates require persistent connections
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=3600
+
+    # Target group attributes for sticky sessions (optional, but recommended for WebSocket)
+    alb.ingress.kubernetes.io/target-group-attributes: stickiness.enabled=true,stickiness.type=lb_cookie,stickiness.lb_cookie.duration_seconds=3600
+
+    # External DNS annotation (if using external-dns)
+    # REPLACE with your domain
+    external-dns.alpha.kubernetes.io/hostname: desktop.vibe-kanban.example.com
+spec:
+  rules:
+    # REPLACE with your actual domain
+    - host: desktop.vibe-kanban.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: vibe-kanban-desktop
+                port:
+                  number: 8081

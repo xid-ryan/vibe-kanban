@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vibe-kanban-ingress
+  namespace: vibe
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80},{"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/ssl-min-version: TLSv1.2
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-FS-1-2-2019-08
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-west-2:310455165573:certificate/f4e3633c-f6b9-47ae-a265-61bc2f7e66cc
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    external-dns.alpha.kubernetes.io/hostname: vibe-kanban.protopie.works
+spec:
+  rules:
+    - host: vibe-kanban.protopie.works
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: vibe-kanban
+                port:
+                  number: 8081

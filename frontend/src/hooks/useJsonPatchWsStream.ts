@@ -3,6 +3,8 @@ import { produce } from 'immer';
 import { applyPatch } from 'rfc6902';
 import type { Operation } from 'rfc6902';
 
+const TOKEN_KEY = 'vibe_kanban_jwt_token';
+
 type WsJsonPatchMsg = { JsonPatch: Operation[] };
 type WsReadyMsg = { Ready: true };
 type WsFinishedMsg = { finished: boolean };
@@ -98,7 +100,14 @@ export const useJsonPatchWsStream = <T extends object>(
 
       // Convert HTTP endpoint to WebSocket endpoint
       const wsEndpoint = endpoint.replace(/^http/, 'ws');
-      const ws = new WebSocket(wsEndpoint);
+
+      // Add JWT token as query parameter for WebSocket authentication
+      // (WebSocket API doesn't support custom headers in browsers)
+      const token = localStorage.getItem(TOKEN_KEY);
+      const wsUrl = token
+        ? `${wsEndpoint}${wsEndpoint.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`
+        : wsEndpoint;
+      const ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
         setError(null);

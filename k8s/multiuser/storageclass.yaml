@@ -1,0 +1,26 @@
+# EFS StorageClass for vibe-kanban workspaces
+# Requires the AWS EFS CSI driver to be installed in the cluster
+# See: https://docs.aws.amazon.com/eks/latest/userguide/efs-csi.html
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-sc
+provisioner: efs.csi.aws.com
+parameters:
+  # EFS file system ID - REPLACE with your actual EFS ID
+  # Create an EFS file system in the same VPC as your EKS cluster
+  fileSystemId: ${EFS_FILE_SYSTEM_ID}
+  # Provisioning mode: efs-ap creates access points for each PVC
+  provisioningMode: efs-ap
+  # Directory permissions for user workspaces
+  directoryPerms: "700"
+  # GID range for dynamic provisioning
+  gidRangeStart: "1000"
+  gidRangeEnd: "2000"
+  # Base path within EFS for vibe-kanban workspaces
+  basePath: "/vibe-kanban"
+  # Ensure unique access point for each PVC
+  ensureUniqueDirectory: "true"
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+allowVolumeExpansion: true

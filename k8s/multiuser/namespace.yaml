@@ -1,0 +1,8 @@
+# Namespace for vibe-kanban resources
+# Create this first if the namespace doesn't exist
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vibe
+  labels:
+    app: vibe-kanban

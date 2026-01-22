@@ -7,7 +7,9 @@ use std::{
 
 static WORKSPACE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
+use db::DeploymentMode;
 use git2::{Error as GitError, Repository};
+use uuid::Uuid;
 use thiserror::Error;
 use tracing::{debug, info, trace};
 use utils::{path::normalize_macos_private_alias, shell::resolve_executable_path};
@@ -543,6 +545,35 @@ impl WorktreeManager {
             return override_path.join(".vibe-kanban-workspaces");
         }
         Self::get_default_worktree_base_dir()
+    }
+
+    /// Get the base directory for vibe-kanban worktrees for a specific user.
+    ///
+    /// In Kubernetes (multi-user) mode, returns `/workspaces/{user_id}/`
+    /// or `{WORKSPACE_BASE_DIR}/{user_id}/` if the env var is set.
+    ///
+    /// In Desktop (single-user) mode, returns the same as `get_worktree_base_dir()`.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The UUID of the user whose worktree base directory to return
+    ///
+    /// # Returns
+    ///
+    /// A `PathBuf` pointing to the user's worktree base directory.
+    pub fn get_worktree_base_dir_for_user(user_id: &Uuid) -> std::path::PathBuf {
+        let mode = DeploymentMode::detect();
+
+        if mode.is_kubernetes() {
+            // In K8s mode, use user-specific subdirectory
+            let base = std::env::var("WORKSPACE_BASE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/workspaces"));
+            base.join(user_id.to_string())
+        } else {
+            // In desktop mode, use the same directory for all (single user)
+            Self::get_worktree_base_dir()
+        }
     }
 
     /// Get the default base directory (ignoring any override)

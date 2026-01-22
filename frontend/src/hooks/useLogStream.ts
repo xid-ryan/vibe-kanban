@@ -1,6 +1,8 @@
 import { useEffect, useState, useRef } from 'react';
 import type { PatchType } from 'shared/types';
 
+const TOKEN_KEY = 'vibe_kanban_jwt_token';
+
 type LogEntry = Extract<PatchType, { type: 'STDOUT' } | { type: 'STDERR' }>;
 
 interface UseLogStreamResult {
@@ -35,9 +37,10 @@ export const useLogStream = (processId: string): UseLogStreamResult => {
       const capturedProcessId = processId;
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = window.location.host;
-      const ws = new WebSocket(
-        `${protocol}//${host}/api/execution-processes/${processId}/raw-logs/ws`
-      );
+      const token = localStorage.getItem(TOKEN_KEY);
+      const baseUrl = `${protocol}//${host}/api/execution-processes/${processId}/raw-logs/ws`;
+      const wsUrl = token ? `${baseUrl}?token=${encodeURIComponent(token)}` : baseUrl;
+      const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
       isIntentionallyClosed.current = false;
 

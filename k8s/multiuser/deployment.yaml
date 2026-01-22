@@ -1,0 +1,124 @@
+# Multi-user deployment for vibe-kanban
+# This deployment is configured for Kubernetes multi-tenant mode with user isolation
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vibe-kanban-desktop
+  namespace: vibe
+  labels:
+    app: vibe-kanban-desktop
+    version: v1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vibe-kanban-desktop
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: vibe-kanban-desktop
+        version: v1
+    spec:
+      serviceAccountName: vibe-kanban-desktop
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: vibe-kanban
+          # Replace with your ECR repository URL
+          image: ${ECR_REPO}/vibe-kanban-desktop:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8081
+              name: http
+              protocol: TCP
+          env:
+            # Deployment mode for multi-user Kubernetes
+            - name: DEPLOYMENT_MODE
+              value: "kubernetes"
+            # Database configuration
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-desktop-secrets
+                  key: database-url
+            # JWT authentication secret
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-desktop-secrets
+                  key: jwt-secret
+            # Configuration encryption key for OAuth credentials
+            - name: CONFIG_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-desktop-secrets
+                  key: config-encryption-key
+            # Workspace base directory (mounted PVC)
+            - name: WORKSPACE_BASE_DIR
+              value: "/workspaces"
+            # Server listen address
+            - name: SERVER_LISTEN_ADDR
+              value: "0.0.0.0:8081"
+            # Rust log level
+            - name: RUST_LOG
+              value: "info,vibe_kanban=debug"
+          volumeMounts:
+            - name: workspaces
+              mountPath: /workspaces
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          # Readiness probe - determines when pod is ready to receive traffic
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+          # Liveness probe - determines when to restart the container
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: workspaces
+          persistentVolumeClaim:
+            claimName: vibe-kanban-workspaces
+      imagePullSecrets:
+        - name: ecr-registry-secret
+      # Pod anti-affinity to spread replicas across nodes
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: vibe-kanban-desktop
+                topologyKey: kubernetes.io/hostname

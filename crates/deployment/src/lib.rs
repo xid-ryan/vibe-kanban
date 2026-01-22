@@ -72,6 +72,8 @@ pub enum DeploymentError {
     Config(#[from] ConfigError),
     #[error("Remote client not configured")]
     RemoteClientNotConfigured,
+    #[error("Database initialization failed: {0}")]
+    DbInit(String),
     #[error(transparent)]
     Other(#[from] AnyhowError),
 }

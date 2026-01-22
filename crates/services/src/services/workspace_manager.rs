@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use db::models::{repo::Repo, workspace::Workspace as DbWorkspace};
+use db::DeploymentMode;
 use sqlx::{Pool, Sqlite};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -33,6 +34,8 @@ pub enum WorkspaceError {
     NoRepositories,
     #[error("Partial workspace creation failed: {0}")]
     PartialCreation(String),
+    #[error("Unauthorized: path {0} is outside user workspace boundary")]
+    Unauthorized(String),
 }
 
 /// Info about a single repo's worktree within a workspace
@@ -207,6 +210,181 @@ impl WorkspaceManager {
     /// Get the base directory for workspaces (same as worktree base dir)
     pub fn get_workspace_base_dir() -> PathBuf {
         WorktreeManager::get_worktree_base_dir()
+    }
+
+    /// Get the base directory for workspaces for a specific user.
+    ///
+    /// In Kubernetes (multi-user) mode, returns `/workspaces/{user_id}/`
+    /// or `{WORKSPACE_BASE_DIR}/{user_id}/` if the env var is set.
+    ///
+    /// In Desktop (single-user) mode, returns the same as `get_workspace_base_dir()`.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The UUID of the user whose workspace directory to return
+    ///
+    /// # Returns
+    ///
+    /// A `PathBuf` pointing to the user's workspace base directory.
+    pub fn get_workspace_base_dir_for_user(user_id: &Uuid) -> PathBuf {
+        let mode = DeploymentMode::detect();
+
+        if mode.is_kubernetes() {
+            // In K8s mode, use user-specific subdirectory
+            let base = std::env::var("WORKSPACE_BASE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/workspaces"));
+            base.join(user_id.to_string())
+        } else {
+            // In desktop mode, use the same directory for all (single user)
+            Self::get_workspace_base_dir()
+        }
+    }
+
+    /// Validate that a given path is within the user's workspace boundary.
+    ///
+    /// This function prevents path traversal attacks and ensures users can only
+    /// access files within their designated workspace directories.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The UUID of the user
+    /// * `path` - The path to validate
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(canonicalized_path)` if the path is within the user's workspace.
+    /// Returns `Err(WorkspaceError::Unauthorized)` if the path is outside the boundary.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let user_id = Uuid::new_v4();
+    /// let path = Path::new("/workspaces/user-uuid/project");
+    /// let validated = WorkspaceManager::validate_user_path(&user_id, path)?;
+    /// ```
+    pub fn validate_user_path(user_id: &Uuid, path: &Path) -> Result<PathBuf, WorkspaceError> {
+        let mode = DeploymentMode::detect();
+
+        // In desktop mode, skip validation (single-user, no isolation needed)
+        if mode.is_desktop() {
+            // Still canonicalize if the path exists, otherwise return as-is
+            return Ok(dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+        }
+
+        // In K8s mode, enforce strict path validation
+        let user_base = Self::get_workspace_base_dir_for_user(user_id);
+
+        // Canonicalize the user's base directory (create if needed for validation)
+        let canonical_base = if user_base.exists() {
+            dunce::canonicalize(&user_base)?
+        } else {
+            // If base doesn't exist yet, use the path as-is for comparison
+            user_base.clone()
+        };
+
+        // Canonicalize the target path
+        // If the path doesn't exist, we need to resolve it relative to detect traversal
+        let canonical_path = if path.exists() {
+            dunce::canonicalize(path)?
+        } else {
+            // For non-existent paths, resolve parent components to detect traversal
+            let mut resolved = PathBuf::new();
+            for component in path.components() {
+                resolved.push(component);
+                // Try to canonicalize what exists so far
+                if resolved.exists() {
+                    resolved = dunce::canonicalize(&resolved)?;
+                }
+            }
+            resolved
+        };
+
+        // Verify the canonical path starts with the user's base directory
+        if canonical_path.starts_with(&canonical_base) {
+            Ok(canonical_path)
+        } else {
+            warn!(
+                user_id = %user_id,
+                requested_path = %path.display(),
+                canonical_path = %canonical_path.display(),
+                user_base = %canonical_base.display(),
+                "Path traversal attempt detected"
+            );
+            Err(WorkspaceError::Unauthorized(path.display().to_string()))
+        }
+    }
+
+    /// Create a workspace with worktrees for all repositories, with user-aware path validation.
+    ///
+    /// In Kubernetes mode, validates that workspace_dir is within the user's workspace boundary.
+    /// In Desktop mode, behaves the same as the original create_workspace.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The UUID of the user creating the workspace
+    /// * `workspace_dir` - The directory where the workspace will be created
+    /// * `repos` - The repositories to include in the workspace
+    /// * `branch_name` - The name of the branch to create worktrees on
+    ///
+    /// # Returns
+    ///
+    /// Returns a `WorktreeContainer` on success, or a `WorkspaceError` on failure.
+    pub async fn create_workspace_for_user(
+        user_id: &Uuid,
+        workspace_dir: &Path,
+        repos: &[RepoWorkspaceInput],
+        branch_name: &str,
+    ) -> Result<WorktreeContainer, WorkspaceError> {
+        // Validate path is within user's workspace boundary
+        Self::validate_user_path(user_id, workspace_dir)?;
+
+        // Ensure user's base directory exists
+        let user_base = Self::get_workspace_base_dir_for_user(user_id);
+        tokio::fs::create_dir_all(&user_base).await?;
+
+        // Delegate to existing create_workspace logic
+        Self::create_workspace(workspace_dir, repos, branch_name).await
+    }
+
+    /// Ensure all worktrees in a workspace exist, with user-aware path validation.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The UUID of the user
+    /// * `workspace_dir` - The workspace directory
+    /// * `repos` - The repositories in the workspace
+    /// * `branch_name` - The branch name for worktrees
+    pub async fn ensure_workspace_exists_for_user(
+        user_id: &Uuid,
+        workspace_dir: &Path,
+        repos: &[Repo],
+        branch_name: &str,
+    ) -> Result<(), WorkspaceError> {
+        // Validate path is within user's workspace boundary
+        Self::validate_user_path(user_id, workspace_dir)?;
+
+        // Delegate to existing ensure_workspace_exists logic
+        Self::ensure_workspace_exists(workspace_dir, repos, branch_name).await
+    }
+
+    /// Clean up all worktrees in a workspace, with user-aware path validation.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The UUID of the user
+    /// * `workspace_dir` - The workspace directory
+    /// * `repos` - The repositories in the workspace
+    pub async fn cleanup_workspace_for_user(
+        user_id: &Uuid,
+        workspace_dir: &Path,
+        repos: &[Repo],
+    ) -> Result<(), WorkspaceError> {
+        // Validate path is within user's workspace boundary
+        Self::validate_user_path(user_id, workspace_dir)?;
+
+        // Delegate to existing cleanup_workspace logic
+        Self::cleanup_workspace(workspace_dir, repos).await
     }
 
     /// Migrate a legacy single-worktree layout to the new workspace layout.

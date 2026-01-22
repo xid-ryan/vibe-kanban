@@ -115,6 +115,12 @@ const makeRequest = async (url: string, options: RequestInit = {}) => {
     headers.set('Content-Type', 'application/json');
   }
 
+  // Add JWT token if available
+  const token = localStorage.getItem('vibe_kanban_jwt_token');
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+
   return fetch(url, {
     ...options,
     headers,

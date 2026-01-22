@@ -63,12 +63,23 @@ use uuid::Uuid;
 
 use crate::{command, copy};
 
+/// Tracks ownership information for an execution process
+#[derive(Clone, Debug)]
+pub struct ExecutionOwnership {
+    /// The user who owns this execution (None for desktop mode)
+    pub user_id: Option<Uuid>,
+    /// The workspace ID this execution belongs to
+    pub workspace_id: Uuid,
+}
+
 #[derive(Clone)]
 pub struct LocalContainerService {
     db: DBService,
     child_store: Arc<RwLock<HashMap<Uuid, Arc<RwLock<AsyncGroupChild>>>>>,
     interrupt_senders: Arc<RwLock<HashMap<Uuid, InterruptSender>>>,
     msg_stores: Arc<RwLock<HashMap<Uuid, Arc<MsgStore>>>>,
+    /// Tracks user ownership of execution processes for multi-user isolation
+    execution_owners: Arc<RwLock<HashMap<Uuid, ExecutionOwnership>>>,
     config: Arc<RwLock<Config>>,
     git: GitService,
     image_service: ImageService,
@@ -92,6 +103,7 @@ impl LocalContainerService {
     ) -> Self {
         let child_store = Arc::new(RwLock::new(HashMap::new()));
         let interrupt_senders = Arc::new(RwLock::new(HashMap::new()));
+        let execution_owners = Arc::new(RwLock::new(HashMap::new()));
         let notification_service = NotificationService::new(config.clone());
 
         let container = LocalContainerService {
@@ -99,6 +111,7 @@ impl LocalContainerService {
             child_store,
             interrupt_senders,
             msg_stores,
+            execution_owners,
             config,
             git,
             image_service,
@@ -136,6 +149,301 @@ impl LocalContainerService {
     async fn take_interrupt_sender(&self, id: &Uuid) -> Option<InterruptSender> {
         let mut map = self.interrupt_senders.write().await;
         map.remove(id)
+    }
+
+    /// Register ownership information for an execution process
+    pub async fn register_execution_owner(
+        &self,
+        execution_id: Uuid,
+        user_id: Option<Uuid>,
+        workspace_id: Uuid,
+    ) {
+        let mut map = self.execution_owners.write().await;
+        map.insert(
+            execution_id,
+            ExecutionOwnership {
+                user_id,
+                workspace_id,
+            },
+        );
+    }
+
+    /// Remove ownership tracking for an execution process
+    pub async fn remove_execution_owner(&self, execution_id: &Uuid) {
+        let mut map = self.execution_owners.write().await;
+        map.remove(execution_id);
+    }
+
+    /// Get the ownership information for an execution process
+    pub async fn get_execution_owner(&self, execution_id: &Uuid) -> Option<ExecutionOwnership> {
+        let map = self.execution_owners.read().await;
+        map.get(execution_id).cloned()
+    }
+
+    /// Validate that a user owns a specific execution process.
+    /// Returns Ok(()) if the user owns the execution or if running in desktop mode (user_id is None).
+    /// Returns Err(ContainerError::Unauthorized) if the user does not own the execution.
+    pub async fn validate_execution_ownership(
+        &self,
+        user_id: Option<&Uuid>,
+        execution_id: &Uuid,
+    ) -> Result<(), ContainerError> {
+        // In desktop mode (no user_id), skip validation
+        let Some(user_id) = user_id else {
+            return Ok(());
+        };
+
+        let map = self.execution_owners.read().await;
+        if let Some(ownership) = map.get(execution_id) {
+            match &ownership.user_id {
+                // Execution has an owner - check if it matches
+                Some(owner_id) if owner_id == user_id => Ok(()),
+                Some(_) => {
+                    let timestamp = chrono::Utc::now().to_rfc3339();
+                    tracing::warn!(
+                        action = "unauthorized_access_attempt",
+                        execution_id = %execution_id,
+                        requesting_user = %user_id,
+                        resource_type = "execution_process",
+                        timestamp = %timestamp,
+                        security_event = true,
+                        "Unauthorized execution process access attempt"
+                    );
+                    Err(ContainerError::Unauthorized(format!(
+                        "execution {} belongs to another user",
+                        execution_id
+                    )))
+                }
+                // Execution has no owner (desktop mode execution) - allow access
+                None => Ok(()),
+            }
+        } else {
+            // No ownership record found - this could be a legacy execution or an error
+            // For safety, deny access in multi-user mode
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            tracing::warn!(
+                action = "unauthorized_access_attempt",
+                execution_id = %execution_id,
+                requesting_user = %user_id,
+                resource_type = "execution_process",
+                reason = "no_ownership_record",
+                timestamp = %timestamp,
+                security_event = true,
+                "Unauthorized execution access - no ownership record"
+            );
+            Err(ContainerError::Unauthorized(format!(
+                "no ownership record for execution {}",
+                execution_id
+            )))
+        }
+    }
+
+    /// Validate that a user owns a workspace by checking through the task -> project chain.
+    /// In desktop mode (user_id is None), validation is skipped.
+    ///
+    /// Note: This validation currently relies on execution-level ownership tracking
+    /// since the Workspace/Task/Project models don't have user_id fields in SQLite mode.
+    /// When PostgreSQL migrations add user_id columns, this can be enhanced to check
+    /// directly via project.user_id.
+    pub async fn validate_workspace_ownership(
+        &self,
+        user_id: Option<&Uuid>,
+        _workspace: &Workspace,
+    ) -> Result<(), ContainerError> {
+        // In desktop mode (no user_id), skip validation
+        let Some(_user_id) = user_id else {
+            return Ok(());
+        };
+
+        // TODO: When PostgreSQL models have user_id fields, implement direct ownership check:
+        // 1. workspace.parent_task().parent_project().user_id == user_id
+        //
+        // For now, workspace-level ownership validation is deferred to:
+        // - Execution-level ownership tracking (via execution_owners HashMap)
+        // - Path-based validation (via validate_user_path)
+        //
+        // This allows the workspace to be accessed if:
+        // - The caller is in desktop mode (user_id is None)
+        // - The workspace path is within the user's workspace boundary (checked separately)
+        Ok(())
+    }
+
+    /// Get MsgStore for an execution with user ownership validation.
+    /// In desktop mode (user_id is None), validation is skipped.
+    pub async fn get_msg_store_for_user(
+        &self,
+        user_id: Option<&Uuid>,
+        execution_id: &Uuid,
+    ) -> Result<Option<Arc<MsgStore>>, ContainerError> {
+        // Validate ownership first
+        self.validate_execution_ownership(user_id, execution_id)
+            .await?;
+
+        let map = self.msg_stores.read().await;
+        Ok(map.get(execution_id).cloned())
+    }
+
+    /// Get child process handle with user ownership validation.
+    /// In desktop mode (user_id is None), validation is skipped.
+    pub async fn get_child_for_user(
+        &self,
+        user_id: Option<&Uuid>,
+        execution_id: &Uuid,
+    ) -> Result<Option<Arc<RwLock<AsyncGroupChild>>>, ContainerError> {
+        // Validate ownership first
+        self.validate_execution_ownership(user_id, execution_id)
+            .await?;
+
+        let map = self.child_store.read().await;
+        Ok(map.get(execution_id).cloned())
+    }
+
+    /// Stop an execution process with user ownership validation.
+    /// In desktop mode (user_id is None), validation is skipped.
+    pub async fn stop_execution_for_user(
+        &self,
+        user_id: Option<&Uuid>,
+        execution_process: &ExecutionProcess,
+        status: ExecutionProcessStatus,
+    ) -> Result<(), ContainerError> {
+        // Validate ownership first
+        self.validate_execution_ownership(user_id, &execution_process.id)
+            .await?;
+
+        // Delegate to the normal stop_execution
+        self.stop_execution(execution_process, status).await
+    }
+
+    /// List all execution processes owned by a specific user.
+    ///
+    /// Returns a list of (execution_id, ownership_info) tuples for all processes
+    /// owned by the specified user. In desktop mode (user_id is None), returns all processes.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The UUID of the user whose processes to list, or None for desktop mode
+    ///
+    /// # Returns
+    ///
+    /// A vector of tuples containing (execution_id, ExecutionOwnership) for each
+    /// process owned by the user.
+    pub async fn list_user_processes(
+        &self,
+        user_id: Option<&Uuid>,
+    ) -> Vec<(Uuid, ExecutionOwnership)> {
+        let map = self.execution_owners.read().await;
+
+        match user_id {
+            Some(uid) => {
+                // In K8s mode, filter to only processes owned by this user
+                map.iter()
+                    .filter(|(_, ownership)| {
+                        ownership
+                            .user_id
+                            .as_ref()
+                            .map(|owner| owner == uid)
+                            .unwrap_or(false)
+                    })
+                    .map(|(exec_id, ownership)| (*exec_id, ownership.clone()))
+                    .collect()
+            }
+            None => {
+                // In desktop mode, return all processes
+                map.iter()
+                    .map(|(exec_id, ownership)| (*exec_id, ownership.clone()))
+                    .collect()
+            }
+        }
+    }
+
+    /// List execution process IDs owned by a specific user.
+    ///
+    /// This is a convenience method that returns only the execution IDs.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The UUID of the user whose processes to list, or None for desktop mode
+    ///
+    /// # Returns
+    ///
+    /// A vector of execution process UUIDs owned by the user.
+    pub async fn list_user_process_ids(&self, user_id: Option<&Uuid>) -> Vec<Uuid> {
+        self.list_user_processes(user_id)
+            .await
+            .into_iter()
+            .map(|(exec_id, _)| exec_id)
+            .collect()
+    }
+
+    /// Get detailed process information for a user's processes.
+    ///
+    /// This method returns both the in-memory ownership tracking and database
+    /// information for all processes owned by the specified user.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The UUID of the user whose processes to list, or None for desktop mode
+    ///
+    /// # Returns
+    ///
+    /// A Result containing a vector of ExecutionProcess records owned by the user.
+    pub async fn get_user_processes_with_status(
+        &self,
+        user_id: Option<&Uuid>,
+    ) -> Result<Vec<ExecutionProcess>, ContainerError> {
+        let process_ids = self.list_user_process_ids(user_id).await;
+
+        let mut processes = Vec::with_capacity(process_ids.len());
+        for exec_id in process_ids {
+            if let Ok(Some(process)) = ExecutionProcess::find_by_id(&self.db.pool, exec_id).await {
+                processes.push(process);
+            }
+        }
+
+        Ok(processes)
+    }
+
+    /// Create a workspace container with user ownership validation.
+    /// In desktop mode (user_id is None), validation is skipped.
+    pub async fn create_for_user(
+        &self,
+        user_id: Option<&Uuid>,
+        workspace: &Workspace,
+    ) -> Result<ContainerRef, ContainerError> {
+        // Validate workspace ownership
+        self.validate_workspace_ownership(user_id, workspace).await?;
+
+        // Additionally validate that workspace path is within user's workspace boundary
+        if let Some(uid) = user_id {
+            if let Some(ref container_ref) = workspace.container_ref {
+                let path = std::path::Path::new(container_ref);
+                WorkspaceManager::validate_user_path(uid, path)?;
+            }
+        }
+
+        // Delegate to the normal create
+        self.create(workspace).await
+    }
+
+    /// Start workspace execution with user ownership validation and user context injection.
+    /// In desktop mode (user_id is None), validation is skipped.
+    pub async fn start_workspace_for_user(
+        &self,
+        user_id: Option<&Uuid>,
+        workspace: &Workspace,
+        executor_profile_id: ExecutorProfileId,
+    ) -> Result<ExecutionProcess, ContainerError> {
+        // Validate workspace ownership
+        self.validate_workspace_ownership(user_id, workspace).await?;
+
+        // Start the workspace (this will call start_execution which registers ownership)
+        let execution_process = self.start_workspace(workspace, executor_profile_id).await?;
+
+        // Register ownership for the new execution
+        self.register_execution_owner(execution_process.id, user_id.copied(), workspace.id)
+            .await;
+
+        Ok(execution_process)
     }
 
     pub async fn cleanup_workspace(db: &DBService, workspace: &Workspace) {
@@ -571,6 +879,9 @@ impl LocalContainerService {
             // Now that commit/next-action/finalization steps for this process are complete,
             // capture the HEAD OID as the definitive "after" state (best-effort).
             container.update_after_head_commits(exec_id).await;
+
+            // Cleanup execution ownership tracking
+            container.remove_execution_owner(&exec_id).await;
 
             // Cleanup msg store
             if let Some(msg_arc) = msg_stores.write().await.remove(&exec_id) {

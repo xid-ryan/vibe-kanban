@@ -7,7 +7,15 @@ use sqlx::{
 };
 use utils::assets::asset_dir;
 
+pub mod mode;
 pub mod models;
+pub mod pg;
+
+// Re-export deployment mode for convenience
+pub use mode::DeploymentMode;
+
+// Re-export PostgreSQL types for convenience
+pub use pg::{DBServicePg, PgTx};
 
 async fn run_migrations(pool: &Pool<Sqlite>) -> Result<(), Error> {
     use std::collections::HashSet;

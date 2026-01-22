@@ -12,6 +12,9 @@ use thiserror::Error;
 #[cfg(not(feature = "qa-mode"))]
 use tokio_util::sync::CancellationToken;
 use ts_rs::TS;
+use uuid::Uuid;
+
+use super::workspace_manager::{WorkspaceError, WorkspaceManager};
 
 #[derive(Clone)]
 pub struct FilesystemService {}
@@ -24,6 +27,17 @@ pub enum FilesystemError {
     PathIsNotDirectory,
     #[error("Failed to read directory: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Unauthorized: path {0} is outside user workspace boundary")]
+    Unauthorized(String),
+}
+
+impl From<WorkspaceError> for FilesystemError {
+    fn from(err: WorkspaceError) -> Self {
+        match err {
+            WorkspaceError::Unauthorized(path) => FilesystemError::Unauthorized(path),
+            other => FilesystemError::Io(std::io::Error::other(other.to_string())),
+        }
+    }
 }
 #[derive(Debug, Serialize, TS)]
 pub struct DirectoryListResponse {
@@ -360,6 +374,241 @@ impl FilesystemService {
         Ok(DirectoryListResponse {
             entries: directory_entries,
             current_path: path.to_string_lossy().to_string(),
+        })
+    }
+
+    // =========================================================================
+    // Multi-user support methods (Kubernetes mode)
+    // =========================================================================
+
+    /// Get the home directory for a specific user.
+    ///
+    /// In Kubernetes mode with multi-user support, this returns the user's
+    /// isolated workspace directory. In Desktop mode (single-user),
+    /// this falls back to the system home directory.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - Optional user UUID. If None, uses desktop mode fallback.
+    ///
+    /// # Returns
+    ///
+    /// Returns the user's home directory path.
+    pub fn get_home_directory_for_user(user_id: Option<&Uuid>) -> PathBuf {
+        match user_id {
+            Some(id) => WorkspaceManager::get_workspace_base_dir_for_user(id),
+            None => Self::get_home_directory(), // Desktop mode fallback
+        }
+    }
+
+    /// Validate that a path is within the user's workspace boundary.
+    ///
+    /// This function prevents path traversal attacks and ensures users can only
+    /// access files within their designated workspace directories.
+    ///
+    /// In Desktop mode, validation is skipped (single-user, no isolation needed).
+    /// In Kubernetes mode, strict path validation is enforced.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The UUID of the user
+    /// * `path` - The path to validate
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(canonicalized_path)` if the path is within the user's workspace.
+    /// Returns `Err(FilesystemError::Unauthorized)` if the path is outside the boundary.
+    pub fn validate_path_for_user(
+        &self,
+        user_id: &Uuid,
+        path: &Path,
+    ) -> Result<PathBuf, FilesystemError> {
+        WorkspaceManager::validate_user_path(user_id, path).map_err(FilesystemError::from)
+    }
+
+    /// List Git repositories with user-aware path restrictions.
+    ///
+    /// In Kubernetes mode, restricts the search to the user's workspace directory.
+    /// In Desktop mode (user_id is None), searches from the specified path or
+    /// system home directory.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - Optional user UUID for workspace restriction
+    /// * `path` - Optional path override (validated against user workspace if user_id is provided)
+    /// * `timeout_ms` - Soft timeout in milliseconds
+    /// * `hard_timeout_ms` - Hard timeout in milliseconds
+    /// * `max_depth` - Maximum directory depth to search
+    #[cfg_attr(feature = "qa-mode", allow(unused_variables))]
+    pub async fn list_git_repos_for_user(
+        &self,
+        user_id: Option<&Uuid>,
+        path: Option<String>,
+        timeout_ms: u64,
+        hard_timeout_ms: u64,
+        max_depth: Option<usize>,
+    ) -> Result<Vec<DirectoryEntry>, FilesystemError> {
+        #[cfg(feature = "qa-mode")]
+        {
+            tracing::info!("QA mode: returning hardcoded QA repos instead of scanning filesystem");
+            super::qa_repos::get_qa_repos()
+        }
+
+        #[cfg(not(feature = "qa-mode"))]
+        {
+            let base_path = match (user_id, path) {
+                // User ID with custom path: validate path is within user workspace
+                (Some(uid), Some(p)) => {
+                    let requested_path = PathBuf::from(&p);
+                    self.validate_path_for_user(uid, &requested_path)?
+                }
+                // User ID without custom path: use user's workspace directory
+                (Some(uid), None) => Self::get_home_directory_for_user(Some(uid)),
+                // No user ID with custom path: desktop mode, use the provided path
+                (None, Some(p)) => PathBuf::from(p),
+                // No user ID, no path: desktop mode, use system home directory
+                (None, None) => Self::get_home_directory(),
+            };
+
+            Self::verify_directory(&base_path)?;
+            self.list_git_repos_with_timeout(
+                vec![base_path],
+                timeout_ms,
+                hard_timeout_ms,
+                max_depth,
+            )
+            .await
+        }
+    }
+
+    /// List common Git repository directories with user-aware path restrictions.
+    ///
+    /// In Kubernetes mode, restricts the search to the user's workspace directory.
+    /// In Desktop mode (user_id is None), searches common development directories.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - Optional user UUID for workspace restriction
+    /// * `timeout_ms` - Soft timeout in milliseconds
+    /// * `hard_timeout_ms` - Hard timeout in milliseconds
+    /// * `max_depth` - Maximum directory depth to search
+    #[cfg_attr(feature = "qa-mode", allow(unused_variables))]
+    pub async fn list_common_git_repos_for_user(
+        &self,
+        user_id: Option<&Uuid>,
+        timeout_ms: u64,
+        hard_timeout_ms: u64,
+        max_depth: Option<usize>,
+    ) -> Result<Vec<DirectoryEntry>, FilesystemError> {
+        #[cfg(feature = "qa-mode")]
+        {
+            tracing::info!(
+                "QA mode: returning hardcoded QA repos instead of scanning common directories"
+            );
+            super::qa_repos::get_qa_repos()
+        }
+
+        #[cfg(not(feature = "qa-mode"))]
+        {
+            match user_id {
+                // Kubernetes mode: search within user's workspace only
+                Some(uid) => {
+                    let user_home = Self::get_home_directory_for_user(Some(uid));
+                    if !user_home.exists() || !user_home.is_dir() {
+                        // User workspace doesn't exist yet, return empty
+                        return Ok(vec![]);
+                    }
+
+                    // Search common subdirectories within user's workspace
+                    let search_strings = ["repos", "dev", "work", "code", "projects"];
+                    let mut paths: Vec<PathBuf> = search_strings
+                        .iter()
+                        .map(|s| user_home.join(s))
+                        .filter(|p| p.exists() && p.is_dir())
+                        .collect();
+                    paths.insert(0, user_home);
+
+                    self.list_git_repos_with_timeout(paths, timeout_ms, hard_timeout_ms, max_depth)
+                        .await
+                }
+                // Desktop mode: use existing behavior
+                None => {
+                    self.list_common_git_repos(timeout_ms, hard_timeout_ms, max_depth)
+                        .await
+                }
+            }
+        }
+    }
+
+    /// List directory contents with user-aware path validation.
+    ///
+    /// In Kubernetes mode, validates that the requested path is within the user's
+    /// workspace boundary. In Desktop mode, uses the existing behavior.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - Optional user UUID for workspace restriction
+    /// * `path` - Optional path to list (defaults to user's home directory)
+    pub async fn list_directory_for_user(
+        &self,
+        user_id: Option<&Uuid>,
+        path: Option<String>,
+    ) -> Result<DirectoryListResponse, FilesystemError> {
+        let resolved_path = match (user_id, path) {
+            // User ID with custom path: validate path is within user workspace
+            (Some(uid), Some(p)) => {
+                let requested_path = PathBuf::from(&p);
+                self.validate_path_for_user(uid, &requested_path)?
+            }
+            // User ID without custom path: use user's workspace directory
+            (Some(uid), None) => Self::get_home_directory_for_user(Some(uid)),
+            // No user ID with custom path: desktop mode, use the provided path
+            (None, Some(p)) => PathBuf::from(p),
+            // No user ID, no path: desktop mode, use system home directory
+            (None, None) => Self::get_home_directory(),
+        };
+
+        Self::verify_directory(&resolved_path)?;
+
+        let entries = fs::read_dir(&resolved_path)?;
+        let mut directory_entries = Vec::new();
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let metadata = entry.metadata().ok();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                // Skip hidden files/directories
+                if name.starts_with('.') && name != ".." {
+                    continue;
+                }
+
+                let is_directory = metadata.is_some_and(|m| m.is_dir());
+                let is_git_repo = if is_directory {
+                    path.join(".git").exists()
+                } else {
+                    false
+                };
+
+                directory_entries.push(DirectoryEntry {
+                    name: name.to_string(),
+                    path,
+                    is_directory,
+                    is_git_repo,
+                    last_modified: None,
+                });
+            }
+        }
+
+        // Sort: directories first, then files, both alphabetically
+        directory_entries.sort_by(|a, b| match (a.is_directory, b.is_directory) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        });
+
+        Ok(DirectoryListResponse {
+            entries: directory_entries,
+            current_path: resolved_path.to_string_lossy().to_string(),
         })
     }
 }

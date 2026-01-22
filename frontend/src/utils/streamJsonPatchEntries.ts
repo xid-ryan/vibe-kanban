@@ -1,6 +1,8 @@
 // streamJsonPatchEntries.ts - WebSocket JSON patch streaming utility
 import { applyPatch, type Operation } from 'rfc6902';
 
+const TOKEN_KEY = 'vibe_kanban_jwt_token';
+
 type PatchContainer<E = unknown> = { entries: E[] };
 
 export interface StreamOptions<E = unknown> {
@@ -46,7 +48,12 @@ export function streamJsonPatchEntries<E = unknown>(
   if (opts.onEntries) subscribers.add(opts.onEntries);
 
   // Convert HTTP endpoint to WebSocket endpoint
-  const wsUrl = url.replace(/^http/, 'ws');
+  const wsEndpoint = url.replace(/^http/, 'ws');
+  // Add JWT token as query parameter for WebSocket authentication
+  const token = localStorage.getItem(TOKEN_KEY);
+  const wsUrl = token
+    ? `${wsEndpoint}${wsEndpoint.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`
+    : wsEndpoint;
   const ws = new WebSocket(wsUrl);
 
   const notify = () => {

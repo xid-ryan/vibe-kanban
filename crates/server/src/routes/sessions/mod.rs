@@ -32,7 +32,7 @@ use utils::response::ApiResponse;
 use uuid::Uuid;
 
 use crate::{
-    DeploymentImpl, error::ApiError, middleware::load_session_middleware,
+    DeploymentImpl, error::ApiError, middleware::{OptionalUserContext, load_session_middleware},
     routes::task_attempts::util::restore_worktrees_to_process,
 };
 
@@ -50,7 +50,17 @@ pub struct CreateSessionRequest {
 pub async fn get_sessions(
     State(deployment): State<DeploymentImpl>,
     Query(query): Query<SessionQuery>,
+    OptionalUserContext(user_ctx): OptionalUserContext,
 ) -> Result<ResponseJson<ApiResponse<Vec<Session>>>, ApiError> {
+    // Log user context for tracing in multi-user mode
+    if let Some(ref ctx) = user_ctx {
+        tracing::debug!(
+            user_id = %ctx.user_id,
+            workspace_id = %query.workspace_id,
+            "Fetching sessions for user"
+        );
+    }
+    // TODO: In K8s mode, verify user owns the workspace before listing sessions
     let pool = &deployment.db().pool;
     let sessions = Session::find_by_workspace_id(pool, query.workspace_id).await?;
     Ok(ResponseJson(ApiResponse::success(sessions)))
@@ -64,8 +74,19 @@ pub async fn get_session(
 
 pub async fn create_session(
     State(deployment): State<DeploymentImpl>,
+    OptionalUserContext(user_ctx): OptionalUserContext,
     Json(payload): Json<CreateSessionRequest>,
 ) -> Result<ResponseJson<ApiResponse<Session>>, ApiError> {
+    // Log user context for tracing in multi-user mode
+    if let Some(ref ctx) = user_ctx {
+        tracing::debug!(
+            user_id = %ctx.user_id,
+            workspace_id = %payload.workspace_id,
+            "Creating session for user"
+        );
+    }
+    // TODO: In K8s mode, verify user owns the workspace before creating session
+
     let pool = &deployment.db().pool;
 
     // Verify workspace exists
@@ -100,8 +121,20 @@ pub struct CreateFollowUpAttempt {
 pub async fn follow_up(
     Extension(session): Extension<Session>,
     State(deployment): State<DeploymentImpl>,
+    OptionalUserContext(user_ctx): OptionalUserContext,
     Json(payload): Json<CreateFollowUpAttempt>,
 ) -> Result<ResponseJson<ApiResponse<ExecutionProcess>>, ApiError> {
+    // Log user context for tracing in multi-user mode
+    if let Some(ref ctx) = user_ctx {
+        tracing::debug!(
+            user_id = %ctx.user_id,
+            session_id = %session.id,
+            workspace_id = %session.workspace_id,
+            "Processing follow-up for user"
+        );
+    }
+    // TODO: In K8s mode, verify user owns the session before processing
+
     let pool = &deployment.db().pool;
 
     // Load workspace from session

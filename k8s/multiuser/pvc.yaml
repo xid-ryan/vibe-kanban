@@ -1,0 +1,16 @@
+# PersistentVolumeClaim for vibe-kanban user workspaces
+# Uses EFS (Elastic File System) for ReadWriteMany access across multiple pods
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vibe-kanban-workspaces
+  namespace: vibe
+  labels:
+    app: vibe-kanban-desktop
+spec:
+  accessModes:
+    - ReadWriteMany  # Required for multi-pod access
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 500Gi

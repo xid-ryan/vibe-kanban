@@ -349,11 +349,38 @@ impl GitCli {
         remote_url: &str,
         refspec: &str,
     ) -> Result<(), GitCliError> {
+        self.fetch_with_refspec_and_token(repo_path, remote_url, refspec, None)
+    }
+
+    /// Fetch a branch with optional OAuth token authentication.
+    ///
+    /// When a token is provided and the remote URL is HTTPS, the token is embedded
+    /// in the URL as `https://oauth2:token@host/path` for authentication.
+    ///
+    /// # Arguments
+    ///
+    /// * `repo_path` - Path to the Git repository
+    /// * `remote_url` - The remote URL to fetch from
+    /// * `refspec` - The refspec to fetch
+    /// * `token` - Optional OAuth access token for authentication
+    pub fn fetch_with_refspec_and_token(
+        &self,
+        repo_path: &Path,
+        remote_url: &str,
+        refspec: &str,
+        token: Option<&str>,
+    ) -> Result<(), GitCliError> {
         let envs = vec![(OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0"))];
+
+        // If token is provided, embed it in the URL for HTTPS authentication
+        let url_with_auth = match token {
+            Some(t) => Self::embed_token_in_url(remote_url, t),
+            None => remote_url.to_string(),
+        };
 
         let args = [
             OsString::from("fetch"),
-            OsString::from(remote_url),
+            OsString::from(&url_with_auth),
             OsString::from(refspec),
         ];
 
@@ -372,6 +399,29 @@ impl GitCli {
         branch: &str,
         force: bool,
     ) -> Result<(), GitCliError> {
+        self.push_with_token(repo_path, remote_url, branch, force, None)
+    }
+
+    /// Push a branch to the given remote with optional OAuth token authentication.
+    ///
+    /// When a token is provided and the remote URL is HTTPS, the token is embedded
+    /// in the URL as `https://oauth2:token@host/path` for authentication.
+    ///
+    /// # Arguments
+    ///
+    /// * `repo_path` - Path to the Git repository
+    /// * `remote_url` - The remote URL to push to
+    /// * `branch` - The branch name to push
+    /// * `force` - Whether to force push
+    /// * `token` - Optional OAuth access token for authentication
+    pub fn push_with_token(
+        &self,
+        repo_path: &Path,
+        remote_url: &str,
+        branch: &str,
+        force: bool,
+        token: Option<&str>,
+    ) -> Result<(), GitCliError> {
         let refspec = if force {
             format!("+refs/heads/{branch}:refs/heads/{branch}")
         } else {
@@ -379,9 +429,15 @@ impl GitCli {
         };
         let envs = vec![(OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0"))];
 
+        // If token is provided, embed it in the URL for HTTPS authentication
+        let url_with_auth = match token {
+            Some(t) => Self::embed_token_in_url(remote_url, t),
+            None => remote_url.to_string(),
+        };
+
         let args = [
             OsString::from("push"),
-            OsString::from(remote_url),
+            OsString::from(&url_with_auth),
             OsString::from(refspec),
         ];
 
@@ -676,6 +732,42 @@ impl GitCli {
         }
     }
 
+    /// Embed an OAuth token in an HTTPS URL for authentication.
+    ///
+    /// For HTTPS URLs, transforms `https://github.com/user/repo.git` into
+    /// `https://oauth2:token@github.com/user/repo.git`.
+    ///
+    /// For SSH URLs or other protocols, returns the URL unchanged as they
+    /// use different authentication mechanisms (SSH keys, etc.).
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - The original remote URL
+    /// * `token` - The OAuth access token to embed
+    ///
+    /// # Returns
+    ///
+    /// A URL string with the token embedded for HTTPS, or the original URL otherwise.
+    fn embed_token_in_url(url: &str, token: &str) -> String {
+        // Only embed credentials for HTTPS URLs
+        if let Some(rest) = url.strip_prefix("https://") {
+            // Check if credentials are already present (contains @ before first /)
+            if let Some(at_pos) = rest.find('@') {
+                if let Some(slash_pos) = rest.find('/') {
+                    if at_pos < slash_pos {
+                        // Credentials already present, return original URL
+                        return url.to_string();
+                    }
+                }
+            }
+            // Embed token using oauth2 as the username
+            format!("https://oauth2:{token}@{rest}")
+        } else {
+            // For SSH or other protocols, return unchanged
+            url.to_string()
+        }
+    }
+
     /// Ensure `git` is available on PATH
     fn ensure_available(&self) -> Result<(), GitCliError> {
         let git = resolve_executable_path_blocking("git").ok_or(GitCliError::NotAvailable)?;
@@ -885,4 +977,62 @@ pub struct WorktreeStatus {
     pub uncommitted_tracked: usize,
     pub untracked: usize,
     pub entries: Vec<StatusEntry>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_embed_token_in_https_url() {
+        let url = "https://github.com/user/repo.git";
+        let token = "test_token_123";
+        let result = GitCli::embed_token_in_url(url, token);
+        assert_eq!(result, "https://oauth2:test_token_123@github.com/user/repo.git");
+    }
+
+    #[test]
+    fn test_embed_token_preserves_existing_credentials() {
+        // URL with existing credentials should be unchanged
+        let url = "https://existing:creds@github.com/user/repo.git";
+        let token = "new_token";
+        let result = GitCli::embed_token_in_url(url, token);
+        assert_eq!(result, url);
+    }
+
+    #[test]
+    fn test_embed_token_ssh_url_unchanged() {
+        // SSH URLs should be unchanged
+        let url = "git@github.com:user/repo.git";
+        let token = "test_token";
+        let result = GitCli::embed_token_in_url(url, token);
+        assert_eq!(result, url);
+    }
+
+    #[test]
+    fn test_embed_token_git_protocol_unchanged() {
+        // git:// protocol URLs should be unchanged
+        let url = "git://github.com/user/repo.git";
+        let token = "test_token";
+        let result = GitCli::embed_token_in_url(url, token);
+        assert_eq!(result, url);
+    }
+
+    #[test]
+    fn test_embed_token_handles_at_in_path() {
+        // @ sign in the path (after /) should not be confused with credentials
+        let url = "https://github.com/user/@special/repo.git";
+        let token = "test_token";
+        let result = GitCli::embed_token_in_url(url, token);
+        assert_eq!(result, "https://oauth2:test_token@github.com/user/@special/repo.git");
+    }
+
+    #[test]
+    fn test_embed_token_enterprise_url() {
+        // Enterprise GitHub URLs should work
+        let url = "https://github.example.com/org/repo.git";
+        let token = "enterprise_token";
+        let result = GitCli::embed_token_in_url(url, token);
+        assert_eq!(result, "https://oauth2:enterprise_token@github.example.com/org/repo.git");
+    }
 }

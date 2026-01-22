@@ -3,6 +3,14 @@ name: Build and Push to ECR
 on:
   workflow_dispatch:
     inputs:
+      image_type:
+        description: 'Image type to build'
+        required: true
+        default: 'remote'
+        type: choice
+        options:
+          - remote
+          - multiuser
       image_tag:
         description: 'Docker image tag'
         required: false
@@ -10,7 +18,6 @@ on:
 
 env:
   AWS_REGION: us-west-2
-  ECR_REPOSITORY: vibe-kanban-remote
 
 jobs:
   build-and-push:
@@ -22,6 +29,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set build variables
+        id: vars
+        env:
+          IMAGE_TYPE: ${{ inputs.image_type }}
+        run: |
+          if [ "$IMAGE_TYPE" = "multiuser" ]; then
+            echo "ecr_repository=vibe-kanban-multiuser" >> $GITHUB_OUTPUT
+            echo "dockerfile=Dockerfile.multiuser" >> $GITHUB_OUTPUT
+          else
+            echo "ecr_repository=vibe-kanban-remote" >> $GITHUB_OUTPUT
+            echo "dockerfile=crates/remote/Dockerfile" >> $GITHUB_OUTPUT
+          fi
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -35,11 +55,45 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build, tag, and push image to Amazon ECR
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ steps.vars.outputs.ecr_repository }}
+          DOCKERFILE: ${{ steps.vars.outputs.dockerfile }}
           IMAGE_TAG: ${{ inputs.image_tag }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
-          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" -f crates/remote/Dockerfile .
-          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          # Build with cache for faster builds
+          docker buildx build \
+            --platform linux/amd64 \
+            --push \
+            --cache-from type=registry,ref="$ECR_REGISTRY/$ECR_REPOSITORY:buildcache" \
+            --cache-to type=registry,ref="$ECR_REGISTRY/$ECR_REPOSITORY:buildcache,mode=max" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$COMMIT_SHA" \
+            -f "$DOCKERFILE" \
+            .
+
           echo "Image pushed: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "Image pushed: $ECR_REGISTRY/$ECR_REPOSITORY:$COMMIT_SHA"
+
+      - name: Output image details
+        env:
+          IMAGE_TYPE: ${{ inputs.image_type }}
+          ECR_REPOSITORY: ${{ steps.vars.outputs.ecr_repository }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          COMMIT_SHA: ${{ github.sha }}
+          DOCKERFILE: ${{ steps.vars.outputs.dockerfile }}
+        run: |
+          echo "### Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Type | $IMAGE_TYPE |" >> $GITHUB_STEP_SUMMARY
+          echo "| Repository | $ECR_REPOSITORY |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | $IMAGE_TAG |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit SHA | $COMMIT_SHA |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dockerfile | $DOCKERFILE |" >> $GITHUB_STEP_SUMMARY

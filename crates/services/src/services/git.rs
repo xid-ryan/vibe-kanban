@@ -1,4 +1,7 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use chrono::{DateTime, Utc};
 use git2::{
@@ -9,13 +12,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ts_rs::TS;
 use utils::diff::{Diff, DiffChangeKind, FileDiffDetails, compute_line_change_counts};
+use uuid::Uuid;
 
 mod cli;
 
 use cli::{ChangeType, StatusDiffEntry, StatusDiffOptions};
 pub use cli::{GitCli, GitCliError};
 
+use super::config_db::{ConfigDbError, ConfigServicePg};
 use super::file_ranker::FileStat;
+use super::oauth_credentials::Credentials;
+use super::workspace_manager::{WorkspaceError, WorkspaceManager};
 
 #[derive(Debug, Error)]
 pub enum GitServiceError {
@@ -37,6 +44,25 @@ pub enum GitServiceError {
     WorktreeDirty(String, String),
     #[error("Rebase in progress; resolve or abort it before retrying")]
     RebaseInProgress,
+    #[error("Unauthorized: path {0} is outside user workspace boundary")]
+    Unauthorized(String),
+    #[error("Credential error: {0}")]
+    CredentialError(String),
+}
+
+impl From<WorkspaceError> for GitServiceError {
+    fn from(err: WorkspaceError) -> Self {
+        match err {
+            WorkspaceError::Unauthorized(path) => GitServiceError::Unauthorized(path),
+            other => GitServiceError::InvalidRepository(other.to_string()),
+        }
+    }
+}
+
+impl From<ConfigDbError> for GitServiceError {
+    fn from(err: ConfigDbError) -> Self {
+        GitServiceError::CredentialError(err.to_string())
+    }
 }
 /// Service for managing Git operations in task execution workflows
 #[derive(Clone)]
@@ -1219,6 +1245,337 @@ impl GitService {
         git.worktree_prune(repo_path)
             .map_err(|e| GitServiceError::InvalidRepository(e.to_string()))?;
         Ok(())
+    }
+
+    // =========================================================================
+    // Multi-user support methods (Kubernetes mode)
+    // =========================================================================
+
+    /// Validate that a repository path is within the user's workspace boundary.
+    ///
+    /// This function prevents path traversal attacks and ensures users can only
+    /// access Git repositories within their designated workspace directories.
+    ///
+    /// In Desktop mode, validation is skipped (single-user, no isolation needed).
+    /// In Kubernetes mode, strict path validation is enforced.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The UUID of the user
+    /// * `repo_path` - The repository path to validate
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(canonicalized_path)` if the path is within the user's workspace.
+    /// Returns `Err(GitServiceError::Unauthorized)` if the path is outside the boundary.
+    pub fn validate_repo_path_for_user(
+        &self,
+        user_id: &Uuid,
+        repo_path: &Path,
+    ) -> Result<PathBuf, GitServiceError> {
+        WorkspaceManager::validate_user_path(user_id, repo_path).map_err(GitServiceError::from)
+    }
+
+    /// Add a worktree with user-aware path validation.
+    ///
+    /// In Kubernetes mode, validates that both repo_path and worktree_path
+    /// are within the user's workspace boundary before performing the operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The UUID of the user
+    /// * `repo_path` - Path to the source repository
+    /// * `worktree_path` - Path where the worktree will be created
+    /// * `branch` - The branch name for the worktree
+    /// * `create_branch` - Whether to create a new branch
+    pub fn add_worktree_for_user(
+        &self,
+        user_id: &Uuid,
+        repo_path: &Path,
+        worktree_path: &Path,
+        branch: &str,
+        create_branch: bool,
+    ) -> Result<(), GitServiceError> {
+        // Validate both paths are within user's workspace
+        self.validate_repo_path_for_user(user_id, repo_path)?;
+        self.validate_repo_path_for_user(user_id, worktree_path)?;
+
+        // Delegate to existing add_worktree logic
+        self.add_worktree(repo_path, worktree_path, branch, create_branch)
+    }
+
+    /// Remove a worktree with user-aware path validation.
+    ///
+    /// In Kubernetes mode, validates that both repo_path and worktree_path
+    /// are within the user's workspace boundary before performing the operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The UUID of the user
+    /// * `repo_path` - Path to the source repository
+    /// * `worktree_path` - Path to the worktree to remove
+    /// * `force` - Whether to force removal
+    pub fn remove_worktree_for_user(
+        &self,
+        user_id: &Uuid,
+        repo_path: &Path,
+        worktree_path: &Path,
+        force: bool,
+    ) -> Result<(), GitServiceError> {
+        // Validate both paths are within user's workspace
+        self.validate_repo_path_for_user(user_id, repo_path)?;
+        self.validate_repo_path_for_user(user_id, worktree_path)?;
+
+        // Delegate to existing remove_worktree logic
+        self.remove_worktree(repo_path, worktree_path, force)
+    }
+
+    /// Move a worktree with user-aware path validation.
+    ///
+    /// In Kubernetes mode, validates that all paths (repo_path, old_path, new_path)
+    /// are within the user's workspace boundary before performing the operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The UUID of the user
+    /// * `repo_path` - Path to the source repository
+    /// * `old_path` - Current worktree path
+    /// * `new_path` - New worktree path
+    pub fn move_worktree_for_user(
+        &self,
+        user_id: &Uuid,
+        repo_path: &Path,
+        old_path: &Path,
+        new_path: &Path,
+    ) -> Result<(), GitServiceError> {
+        // Validate all paths are within user's workspace
+        self.validate_repo_path_for_user(user_id, repo_path)?;
+        self.validate_repo_path_for_user(user_id, old_path)?;
+        self.validate_repo_path_for_user(user_id, new_path)?;
+
+        // Delegate to existing move_worktree logic
+        self.move_worktree(repo_path, old_path, new_path)
+    }
+
+    /// Open a repository with user-aware path validation.
+    ///
+    /// In Kubernetes mode, validates that repo_path is within the user's
+    /// workspace boundary before opening the repository.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The UUID of the user
+    /// * `repo_path` - Path to the repository to open
+    pub fn open_repo_for_user(
+        &self,
+        user_id: &Uuid,
+        repo_path: &Path,
+    ) -> Result<Repository, GitServiceError> {
+        // Validate path is within user's workspace
+        let validated_path = self.validate_repo_path_for_user(user_id, repo_path)?;
+
+        // Delegate to existing open_repo logic
+        self.open_repo(&validated_path)
+    }
+
+    /// Commit changes with user-aware path validation.
+    ///
+    /// In Kubernetes mode, validates that the path is within the user's
+    /// workspace boundary before committing.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The UUID of the user
+    /// * `path` - Path to the repository
+    /// * `message` - Commit message
+    pub fn commit_for_user(
+        &self,
+        user_id: &Uuid,
+        path: &Path,
+        message: &str,
+    ) -> Result<bool, GitServiceError> {
+        // Validate path is within user's workspace
+        let validated_path = self.validate_repo_path_for_user(user_id, path)?;
+
+        // Delegate to existing commit logic
+        self.commit(&validated_path, message)
+    }
+
+    /// Retrieve OAuth credentials for a user from the ConfigService.
+    ///
+    /// This method fetches the user's stored OAuth credentials from the database,
+    /// which can then be used for authenticated Git operations (push, fetch, clone).
+    ///
+    /// # Arguments
+    ///
+    /// * `config_service` - The ConfigServicePg instance to query
+    /// * `user_id` - The UUID of the user
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(Some(Credentials))` if credentials exist, `Ok(None)` if not,
+    /// or an error if the database query fails.
+    pub async fn get_user_credentials(
+        &self,
+        config_service: &ConfigServicePg,
+        user_id: &Uuid,
+    ) -> Result<Option<Credentials>, GitServiceError> {
+        let credentials = config_service.get_credentials(*user_id).await?;
+        Ok(credentials)
+    }
+
+    /// Push to remote with user-aware path validation and optional OAuth credentials.
+    ///
+    /// In Kubernetes mode, validates that the path is within the user's workspace
+    /// boundary and uses the user's OAuth credentials from ConfigService for
+    /// authenticated push operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The UUID of the user
+    /// * `worktree_path` - Path to the worktree
+    /// * `branch_name` - The branch name to push
+    /// * `force` - Whether to force push
+    /// * `credentials` - Optional OAuth credentials for authentication
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` on successful push, or an error if validation or push fails.
+    pub fn push_to_remote_for_user(
+        &self,
+        user_id: &Uuid,
+        worktree_path: &Path,
+        branch_name: &str,
+        force: bool,
+        credentials: Option<&Credentials>,
+    ) -> Result<(), GitServiceError> {
+        // Validate path is within user's workspace
+        let validated_path = self.validate_repo_path_for_user(user_id, worktree_path)?;
+
+        let repo = Repository::open(&validated_path)?;
+        self.check_worktree_clean(&repo)?;
+
+        // Get the remote
+        let remote_name = self.default_remote_name(&repo);
+        let remote = repo.find_remote(&remote_name)?;
+
+        let remote_url = remote
+            .url()
+            .ok_or_else(|| GitServiceError::InvalidRepository("Remote has no URL".to_string()))?;
+
+        // Extract access token from credentials if available
+        let token = credentials.and_then(|c| c.access_token.as_deref());
+
+        let git_cli = GitCli::new();
+        if let Err(e) = git_cli.push_with_token(&validated_path, remote_url, branch_name, force, token) {
+            tracing::error!("Push to remote failed: {}", e);
+            return Err(e.into());
+        }
+
+        let mut branch = Self::find_branch(&repo, branch_name)?;
+        if !branch.get().is_remote() {
+            if let Some(branch_target) = branch.get().target() {
+                let remote_ref = format!("refs/remotes/{remote_name}/{branch_name}");
+                repo.reference(
+                    &remote_ref,
+                    branch_target,
+                    true,
+                    "update remote tracking branch",
+                )?;
+            }
+            branch.set_upstream(Some(&format!("{remote_name}/{branch_name}")))?;
+        }
+
+        Ok(())
+    }
+
+    /// Fetch from remote with user-aware path validation and optional OAuth credentials.
+    ///
+    /// In Kubernetes mode, validates that the path is within the user's workspace
+    /// boundary and uses the user's OAuth credentials from ConfigService for
+    /// authenticated fetch operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The UUID of the user
+    /// * `repo_path` - Path to the repository
+    /// * `credentials` - Optional OAuth credentials for authentication
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` on successful fetch, or an error if validation or fetch fails.
+    pub fn fetch_all_for_user(
+        &self,
+        user_id: &Uuid,
+        repo_path: &Path,
+        credentials: Option<&Credentials>,
+    ) -> Result<(), GitServiceError> {
+        // Validate path is within user's workspace
+        let validated_path = self.validate_repo_path_for_user(user_id, repo_path)?;
+
+        let repo = Repository::open(&validated_path)?;
+        let remote_name = self.default_remote_name(&repo);
+        let remote = repo.find_remote(&remote_name)?;
+
+        let remote_url = remote
+            .url()
+            .ok_or_else(|| GitServiceError::InvalidRepository("Remote has no URL".to_string()))?;
+
+        // Extract access token from credentials if available
+        let token = credentials.and_then(|c| c.access_token.as_deref());
+
+        let refspec = format!("+refs/heads/*:refs/remotes/{remote_name}/*");
+        let git_cli = GitCli::new();
+        if let Err(e) = git_cli.fetch_with_refspec_and_token(&validated_path, remote_url, &refspec, token) {
+            tracing::error!("Fetch from remote failed: {}", e);
+            return Err(e.into());
+        }
+
+        Ok(())
+    }
+
+    /// Convenience method to push with credentials retrieved from ConfigService.
+    ///
+    /// This async method retrieves the user's credentials from the database and
+    /// performs the push operation in one call.
+    ///
+    /// # Arguments
+    ///
+    /// * `config_service` - The ConfigServicePg instance to query for credentials
+    /// * `user_id` - The UUID of the user
+    /// * `worktree_path` - Path to the worktree
+    /// * `branch_name` - The branch name to push
+    /// * `force` - Whether to force push
+    pub async fn push_to_remote_with_config_credentials(
+        &self,
+        config_service: &ConfigServicePg,
+        user_id: &Uuid,
+        worktree_path: &Path,
+        branch_name: &str,
+        force: bool,
+    ) -> Result<(), GitServiceError> {
+        let credentials = self.get_user_credentials(config_service, user_id).await?;
+        self.push_to_remote_for_user(user_id, worktree_path, branch_name, force, credentials.as_ref())
+    }
+
+    /// Convenience method to fetch with credentials retrieved from ConfigService.
+    ///
+    /// This async method retrieves the user's credentials from the database and
+    /// performs the fetch operation in one call.
+    ///
+    /// # Arguments
+    ///
+    /// * `config_service` - The ConfigServicePg instance to query for credentials
+    /// * `user_id` - The UUID of the user
+    /// * `repo_path` - Path to the repository
+    pub async fn fetch_all_with_config_credentials(
+        &self,
+        config_service: &ConfigServicePg,
+        user_id: &Uuid,
+        repo_path: &Path,
+    ) -> Result<(), GitServiceError> {
+        let credentials = self.get_user_credentials(config_service, user_id).await?;
+        self.fetch_all_for_user(user_id, repo_path, credentials.as_ref())
     }
 
     pub fn get_all_branches(&self, repo_path: &Path) -> Result<Vec<GitBranch>, git2::Error> {

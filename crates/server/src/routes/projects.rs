@@ -31,7 +31,7 @@ use utils::{
 };
 use uuid::Uuid;
 
-use crate::{DeploymentImpl, error::ApiError, middleware::load_project_middleware};
+use crate::{DeploymentImpl, error::ApiError, middleware::{OptionalUserContext, load_project_middleware}};
 
 #[derive(Deserialize, TS)]
 pub struct LinkToExistingRequest {
@@ -46,7 +46,13 @@ pub struct CreateRemoteProjectRequest {
 
 pub async fn get_projects(
     State(deployment): State<DeploymentImpl>,
+    OptionalUserContext(user_ctx): OptionalUserContext,
 ) -> Result<ResponseJson<ApiResponse<Vec<Project>>>, ApiError> {
+    // Log user context for tracing in multi-user mode
+    if let Some(ref ctx) = user_ctx {
+        tracing::debug!(user_id = %ctx.user_id, "Fetching projects for user");
+    }
+    // TODO: In K8s mode, filter projects by user_id once DB schema supports it
     let projects = Project::find_all(&deployment.db().pool).await?;
     Ok(ResponseJson(ApiResponse::success(projects)))
 }
@@ -217,11 +223,18 @@ async fn apply_remote_project_link(
 
 pub async fn create_project(
     State(deployment): State<DeploymentImpl>,
+    OptionalUserContext(user_ctx): OptionalUserContext,
     Json(payload): Json<CreateProject>,
 ) -> Result<ResponseJson<ApiResponse<Project>>, ApiError> {
-    tracing::debug!("Creating project '{}'", payload.name);
+    // Log user context for tracing in multi-user mode
+    if let Some(ref ctx) = user_ctx {
+        tracing::debug!(user_id = %ctx.user_id, project_name = %payload.name, "Creating project for user");
+    } else {
+        tracing::debug!(project_name = %payload.name, "Creating project (desktop mode)");
+    }
     let repo_count = payload.repositories.len();
 
+    // TODO: In K8s mode, associate project with user_id once DB schema supports it
     match deployment
         .project()
         .create_project(&deployment.db().pool, deployment.repo(), payload)
@@ -282,7 +295,13 @@ pub async fn update_project(
 pub async fn delete_project(
     Extension(project): Extension<Project>,
     State(deployment): State<DeploymentImpl>,
+    OptionalUserContext(user_ctx): OptionalUserContext,
 ) -> Result<ResponseJson<ApiResponse<()>>, StatusCode> {
+    // Log user context for tracing in multi-user mode
+    if let Some(ref ctx) = user_ctx {
+        tracing::debug!(user_id = %ctx.user_id, project_id = %project.id, "Deleting project for user");
+    }
+    // TODO: In K8s mode, verify user owns the project before deletion
     match deployment
         .project()
         .delete_project(&deployment.db().pool, project.id)

@@ -1,0 +1,17 @@
+# Service for vibe-kanban-desktop multi-user deployment
+apiVersion: v1
+kind: Service
+metadata:
+  name: vibe-kanban-desktop
+  namespace: vibe
+  labels:
+    app: vibe-kanban-desktop
+spec:
+  type: ClusterIP
+  selector:
+    app: vibe-kanban-desktop
+  ports:
+    - name: http
+      port: 8081
+      targetPort: 8081
+      protocol: TCP

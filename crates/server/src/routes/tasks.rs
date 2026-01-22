@@ -30,7 +30,7 @@ use utils::response::ApiResponse;
 use uuid::Uuid;
 
 use crate::{
-    DeploymentImpl, error::ApiError, middleware::load_task_middleware,
+    DeploymentImpl, error::ApiError, middleware::{OptionalUserContext, load_task_middleware},
     routes::task_attempts::WorkspaceRepoInput,
 };
 
@@ -42,7 +42,13 @@ pub struct TaskQuery {
 pub async fn get_tasks(
     State(deployment): State<DeploymentImpl>,
     Query(query): Query<TaskQuery>,
+    OptionalUserContext(user_ctx): OptionalUserContext,
 ) -> Result<ResponseJson<ApiResponse<Vec<TaskWithAttemptStatus>>>, ApiError> {
+    // Log user context for tracing in multi-user mode
+    if let Some(ref ctx) = user_ctx {
+        tracing::debug!(user_id = %ctx.user_id, project_id = %query.project_id, "Fetching tasks for user");
+    }
+    // TODO: In K8s mode, verify user owns the project before listing tasks
     let tasks =
         Task::find_by_project_id_with_attempt_status(&deployment.db().pool, query.project_id)
             .await?;
@@ -106,15 +112,27 @@ pub async fn get_task(
 
 pub async fn create_task(
     State(deployment): State<DeploymentImpl>,
+    OptionalUserContext(user_ctx): OptionalUserContext,
     Json(payload): Json<CreateTask>,
 ) -> Result<ResponseJson<ApiResponse<Task>>, ApiError> {
     let id = Uuid::new_v4();
 
-    tracing::debug!(
-        "Creating task '{}' in project {}",
-        payload.title,
-        payload.project_id
-    );
+    // Log user context for tracing in multi-user mode
+    if let Some(ref ctx) = user_ctx {
+        tracing::debug!(
+            user_id = %ctx.user_id,
+            task_title = %payload.title,
+            project_id = %payload.project_id,
+            "Creating task for user"
+        );
+    } else {
+        tracing::debug!(
+            task_title = %payload.title,
+            project_id = %payload.project_id,
+            "Creating task (desktop mode)"
+        );
+    }
+    // TODO: In K8s mode, verify user owns the project before creating task
 
     let task = Task::create(&deployment.db().pool, &payload, id).await?;
 
@@ -146,6 +164,7 @@ pub struct CreateAndStartTaskRequest {
 
 pub async fn create_task_and_start(
     State(deployment): State<DeploymentImpl>,
+    OptionalUserContext(user_ctx): OptionalUserContext,
     Json(payload): Json<CreateAndStartTaskRequest>,
 ) -> Result<ResponseJson<ApiResponse<TaskWithAttemptStatus>>, ApiError> {
     if payload.repos.is_empty() {
@@ -153,6 +172,17 @@ pub async fn create_task_and_start(
             "At least one repository is required".to_string(),
         ));
     }
+
+    // Log user context for tracing in multi-user mode
+    if let Some(ref ctx) = user_ctx {
+        tracing::debug!(
+            user_id = %ctx.user_id,
+            task_title = %payload.task.title,
+            project_id = %payload.task.project_id,
+            "Creating and starting task for user"
+        );
+    }
+    // TODO: In K8s mode, verify user owns the project before creating task
 
     let pool = &deployment.db().pool;
 
@@ -285,7 +315,19 @@ pub async fn update_task(
 pub async fn delete_task(
     Extension(task): Extension<Task>,
     State(deployment): State<DeploymentImpl>,
+    OptionalUserContext(user_ctx): OptionalUserContext,
 ) -> Result<(StatusCode, ResponseJson<ApiResponse<()>>), ApiError> {
+    // Log user context for tracing in multi-user mode
+    if let Some(ref ctx) = user_ctx {
+        tracing::debug!(
+            user_id = %ctx.user_id,
+            task_id = %task.id,
+            project_id = %task.project_id,
+            "Deleting task for user"
+        );
+    }
+    // TODO: In K8s mode, verify user owns the task before deletion
+
     let pool = &deployment.db().pool;
 
     // Gather task attempts data needed for background cleanup

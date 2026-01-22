@@ -10,13 +10,13 @@ use axum::{
     routing::get,
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use db::models::{workspace::Workspace, workspace_repo::WorkspaceRepo};
+use db::{DeploymentMode, models::{workspace::Workspace, workspace_repo::WorkspaceRepo}};
 use deployment::Deployment;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{DeploymentImpl, error::ApiError};
+use crate::{DeploymentImpl, error::ApiError, middleware::{verify_jwt, UserContext}};
 
 #[derive(Debug, Deserialize)]
 pub struct TerminalQuery {
@@ -25,6 +25,10 @@ pub struct TerminalQuery {
     pub cols: u16,
     #[serde(default = "default_rows")]
     pub rows: u16,
+    /// JWT token for WebSocket authentication in K8s mode.
+    /// WebSocket connections cannot use standard Authorization headers,
+    /// so the token is passed as a query parameter.
+    pub token: Option<String>,
 }
 
 fn default_cols() -> u16 {
@@ -49,11 +53,63 @@ enum TerminalMessage {
     Error { message: String },
 }
 
+/// Validate WebSocket authentication for terminal connections.
+///
+/// In K8s mode, validates the JWT token passed as a query parameter.
+/// In Desktop mode, authentication is skipped.
+///
+/// Returns the validated UserContext if in K8s mode, or None in desktop mode.
+fn validate_ws_auth(token: Option<&str>) -> Result<Option<UserContext>, ApiError> {
+    let mode = DeploymentMode::detect();
+
+    if mode.is_kubernetes() {
+        // In K8s mode, require authentication
+        let token = token.ok_or_else(|| {
+            tracing::warn!("Terminal WebSocket connection missing auth token in K8s mode");
+            ApiError::Unauthorized
+        })?;
+
+        // Get JWT secret from environment
+        let secret = std::env::var("JWT_SECRET").map_err(|_| {
+            tracing::error!("JWT_SECRET not configured for terminal auth");
+            ApiError::BadRequest("Authentication not configured".to_string())
+        })?;
+
+        // Verify the token
+        let user_ctx = verify_jwt(token, secret.as_bytes()).map_err(|e| {
+            tracing::warn!(error = %e, "Terminal WebSocket auth failed");
+            ApiError::Unauthorized
+        })?;
+
+        tracing::debug!(
+            user_id = %user_ctx.user_id,
+            "Terminal WebSocket authenticated"
+        );
+
+        Ok(Some(user_ctx))
+    } else {
+        // Desktop mode - no authentication required
+        Ok(None)
+    }
+}
+
 pub async fn terminal_ws(
     ws: WebSocketUpgrade,
     State(deployment): State<DeploymentImpl>,
     Query(query): Query<TerminalQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Validate authentication for WebSocket connection
+    let user_ctx = validate_ws_auth(query.token.as_deref())?;
+
+    if let Some(ref ctx) = user_ctx {
+        tracing::debug!(
+            user_id = %ctx.user_id,
+            workspace_id = %query.workspace_id,
+            "Opening terminal for user"
+        );
+    }
+    // TODO: In K8s mode, verify user owns the workspace before allowing terminal access
+
     let attempt = Workspace::find_by_id(&deployment.db().pool, query.workspace_id)
         .await?
         .ok_or_else(|| ApiError::BadRequest("Attempt not found".to_string()))?;
@@ -87,8 +143,11 @@ pub async fn terminal_ws(
         }
     }
 
+    // Get user_id for PTY session (use a nil UUID for desktop mode)
+    let user_id = user_ctx.as_ref().map(|ctx| ctx.user_id).unwrap_or(Uuid::nil());
+
     Ok(ws.on_upgrade(move |socket| {
-        handle_terminal_ws(socket, deployment, working_dir, query.cols, query.rows)
+        handle_terminal_ws(socket, deployment, working_dir, query.cols, query.rows, user_id)
     }))
 }
 
@@ -98,10 +157,11 @@ async fn handle_terminal_ws(
     working_dir: PathBuf,
     cols: u16,
     rows: u16,
+    user_id: Uuid,
 ) {
     let (session_id, mut output_rx) = match deployment
         .pty()
-        .create_session(working_dir, cols, rows)
+        .create_session(user_id, working_dir, cols, rows)
         .await
     {
         Ok(result) => result,
@@ -140,11 +200,11 @@ async fn handle_terminal_ws(
                     match cmd {
                         TerminalCommand::Input { data } => {
                             if let Ok(bytes) = BASE64.decode(&data) {
-                                let _ = pty_service.write(session_id_for_input, &bytes).await;
+                                let _ = pty_service.write(user_id, session_id_for_input, &bytes).await;
                             }
                         }
                         TerminalCommand::Resize { cols, rows } => {
-                            let _ = pty_service.resize(session_id_for_input, cols, rows).await;
+                            let _ = pty_service.resize(user_id, session_id_for_input, cols, rows).await;
                         }
                     }
                 }
@@ -154,7 +214,7 @@ async fn handle_terminal_ws(
         }
     }
 
-    let _ = deployment.pty().close_session(session_id).await;
+    let _ = deployment.pty().close_session(user_id, session_id).await;
     output_task.abort();
 }
 

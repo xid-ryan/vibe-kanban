@@ -10,6 +10,8 @@ import {
 import type { Terminal } from '@xterm/xterm';
 import type { FitAddon } from '@xterm/addon-fit';
 
+const TOKEN_KEY = 'vibe_kanban_jwt_token';
+
 export interface TerminalInstance {
   terminal: Terminal;
   fitAddon: FitAddon;
@@ -326,9 +328,13 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
       // Store callbacks in ref so they can be updated without recreating connection
       connectionCallbacksRef.current.set(tabId, { onData, onExit });
 
-      // Create new WebSocket
+      // Create new WebSocket with JWT token as query param
       const wsEndpoint = endpoint.replace(/^http/, 'ws');
-      const ws = new WebSocket(wsEndpoint);
+      const token = localStorage.getItem(TOKEN_KEY);
+      const wsUrl = token
+        ? `${wsEndpoint}${wsEndpoint.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`
+        : wsEndpoint;
+      const ws = new WebSocket(wsUrl);
 
       ws.onmessage = (event) => {
         try {

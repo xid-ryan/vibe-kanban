@@ -2,6 +2,7 @@ pub mod analytics;
 pub mod approvals;
 pub mod auth;
 pub mod config;
+pub mod config_db;
 pub mod container;
 pub mod diff_stream;
 pub mod events;

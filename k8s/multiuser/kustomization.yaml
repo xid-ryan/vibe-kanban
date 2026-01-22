@@ -1,0 +1,28 @@
+# Kustomization for vibe-kanban-desktop multi-user deployment
+# Deploy with: kubectl apply -k k8s/multiuser/
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: vibe
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - storageclass.yaml
+  - pvc.yaml
+  - secrets.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+
+commonLabels:
+  app.kubernetes.io/name: vibe-kanban-desktop
+  app.kubernetes.io/component: backend
+  app.kubernetes.io/part-of: vibe-kanban
+
+# Image customization (update tag for deployments)
+# Example: kustomize edit set image ${ECR_REPO}/vibe-kanban-desktop=your-repo/image:tag
+images:
+  - name: ${ECR_REPO}/vibe-kanban-desktop
+    newName: ${ECR_REPO}/vibe-kanban-desktop
+    newTag: latest

@@ -27,7 +27,7 @@ use tokio::fs;
 use ts_rs::TS;
 use utils::{api::oauth::LoginStatus, assets::config_path, response::ApiResponse};
 
-use crate::{DeploymentImpl, error::ApiError};
+use crate::{DeploymentImpl, error::ApiError, middleware::OptionalUserContext};
 
 pub fn router() -> Router<DeploymentImpl> {
     Router::new()
@@ -85,7 +85,13 @@ pub struct UserSystemInfo {
 #[axum::debug_handler]
 async fn get_user_system_info(
     State(deployment): State<DeploymentImpl>,
+    OptionalUserContext(user_ctx): OptionalUserContext,
 ) -> ResponseJson<ApiResponse<UserSystemInfo>> {
+    // Log user context for tracing in multi-user mode
+    if let Some(ref ctx) = user_ctx {
+        tracing::debug!(user_id = %ctx.user_id, "Fetching user system info");
+    }
+    // TODO: In K8s mode, load config from database using ConfigServicePg
     let config = deployment.config().read().await;
     let login_status = deployment.get_login_status().await;
 
@@ -112,8 +118,15 @@ async fn get_user_system_info(
 
 async fn update_config(
     State(deployment): State<DeploymentImpl>,
+    OptionalUserContext(user_ctx): OptionalUserContext,
     Json(new_config): Json<Config>,
 ) -> ResponseJson<ApiResponse<Config>> {
+    // Log user context for tracing in multi-user mode
+    if let Some(ref ctx) = user_ctx {
+        tracing::debug!(user_id = %ctx.user_id, "Updating config for user");
+    }
+    // TODO: In K8s mode, save config to database using ConfigServicePg
+
     let config_path = config_path();
 
     // Validate git branch prefix

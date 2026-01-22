@@ -6,10 +6,9 @@ metadata:
 data:
   SERVER_LISTEN_ADDR: "0.0.0.0:8081"
   ELECTRIC_URL: "http://electric:3000"
-  # Update these URLs to your actual domain
-  SERVER_PUBLIC_BASE_URL: "http://localhost:8081"
-  VITE_APP_BASE_URL: "http://localhost:8081"
-  VITE_API_BASE_URL: "http://localhost:8081"
+  SERVER_PUBLIC_BASE_URL: "https://vibe-kanban.protopie.works"
+  VITE_APP_BASE_URL: "https://vibe-kanban.protopie.works"
+  VITE_API_BASE_URL: "https://vibe-kanban.protopie.works"
 ---
 apiVersion: v1
 kind: Service
@@ -133,6 +132,11 @@ spec:
                 secretKeyRef:
                   name: vibe-kanban-secrets
                   key: GOOGLE_OAUTH_CLIENT_SECRET
+            - name: LOOPS_EMAIL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vibe-kanban-secrets
+                  key: LOOPS_EMAIL_API_KEY
             # Optional: R2/S3 and GitHub App env vars removed
             # Add them back when you have valid values in the secret
           readinessProbe:

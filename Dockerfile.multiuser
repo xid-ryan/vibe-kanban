@@ -1,0 +1,140 @@
+# syntax=docker/dockerfile:1.6
+#
+# Multi-user Kubernetes Deployment Dockerfile
+# Builds the vibe-kanban server for multi-tenant K8s deployment with:
+# - Multi-stage build for smaller image size
+# - Non-root user for security
+# - Git and other required system dependencies
+# - Proper workspace directory setup
+#
+
+ARG APP_NAME=server
+
+# =============================================================================
+# Stage 1: Frontend Build
+# =============================================================================
+FROM node:20-alpine AS fe-builder
+WORKDIR /repo
+
+RUN corepack enable
+
+# Copy package files for dependency caching
+COPY pnpm-lock.yaml pnpm-workspace.yaml package.json ./
+COPY frontend/package.json frontend/package.json
+COPY npx-cli/package.json npx-cli/package.json
+COPY shared/package.json shared/package.json
+
+# Install frontend dependencies
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
+    pnpm install --filter ./frontend --frozen-lockfile
+
+# Copy frontend source and build
+COPY frontend/ frontend/
+COPY shared/ shared/
+
+RUN pnpm -C frontend build
+
+# =============================================================================
+# Stage 2: Rust Backend Build
+# =============================================================================
+FROM rust:1.89-slim-bookworm AS builder
+ARG APP_NAME
+
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+ENV RUST_MIN_STACK=16777216
+# Enable SQLx offline mode - uses sqlx-data.json for compile-time checks
+ENV SQLX_OFFLINE=true
+
+# Install build dependencies
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+     pkg-config \
+     libssl-dev \
+     ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy Cargo files for dependency caching
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+COPY shared shared
+COPY assets assets
+
+RUN mkdir -p /app/bin
+
+# Build the server binary with caching
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --locked --release -p "${APP_NAME}" \
+ && cp target/release/${APP_NAME} /app/bin/${APP_NAME}
+
+# =============================================================================
+# Stage 3: Runtime Image
+# =============================================================================
+FROM debian:bookworm-slim AS runtime
+ARG APP_NAME
+
+# Install runtime dependencies
+# - ca-certificates: SSL/TLS certificate validation
+# - libssl3: OpenSSL runtime library
+# - wget: Health check HTTP requests
+# - git: Git operations for workspaces
+# - openssh-client: SSH for Git authentication
+# - curl: HTTP client utilities
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+     ca-certificates \
+     libssl3 \
+     wget \
+     git \
+     openssh-client \
+     curl \
+  && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for security (principle of least privilege)
+# Using UID 10001 to avoid conflicts with host system UIDs
+RUN useradd --system --create-home --uid 10001 --shell /bin/bash appuser
+
+# Create workspace directories
+# /workspaces - Base directory for user workspaces (mounted as PVC in K8s)
+# /srv/static - Static frontend assets
+RUN mkdir -p /workspaces /srv/static \
+  && chown -R appuser:appuser /workspaces /srv/static
+
+WORKDIR /srv
+
+# Copy built artifacts
+COPY --from=builder /app/bin/${APP_NAME} /usr/local/bin/${APP_NAME}
+COPY --from=fe-builder /repo/frontend/dist /srv/static
+
+# Copy assets directory for runtime
+COPY --chown=appuser:appuser assets /srv/assets
+
+# Switch to non-root user
+USER appuser
+
+# Configure Git for the appuser
+RUN git config --global init.defaultBranch main \
+  && git config --global user.name "Vibe Kanban" \
+  && git config --global user.email "vibe-kanban@local"
+
+# Environment configuration
+# These can be overridden via K8s ConfigMap/Secrets
+ENV HOST=0.0.0.0 \
+    PORT=8081 \
+    RUST_LOG=info \
+    DEPLOYMENT_MODE=kubernetes \
+    WORKSPACE_BASE_DIR=/workspaces
+
+# Expose the service port
+EXPOSE 8081
+
+# Health check configuration
+# Matches K8s readiness/liveness probe expectations
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["wget", "--spider", "-q", "http://127.0.0.1:8081/health"]
+
+# Run the server
+ENTRYPOINT ["/usr/local/bin/server"]

@@ -34,6 +34,8 @@ import { DisclaimerDialog } from '@/components/dialogs/global/DisclaimerDialog';
 import { OnboardingDialog } from '@/components/dialogs/global/OnboardingDialog';
 import { ReleaseNotesDialog } from '@/components/dialogs/global/ReleaseNotesDialog';
 import { ClickedElementsProvider } from './contexts/ClickedElementsProvider';
+import { AuthProvider, useJwtAuth } from '@/contexts/AuthContext';
+import { LoginPage } from '@/components/LoginPage';
 
 // Design scope components
 import { LegacyDesignScope } from '@/components/legacy-design/LegacyDesignScope';
@@ -47,13 +49,45 @@ import { ElectricTestPage } from '@/pages/ui-new/ElectricTestPage';
 
 const SentryRoutes = Sentry.withSentryReactRouterV6Routing(Routes);
 
+/**
+ * AuthGate: Checks JWT authentication BEFORE any API-calling providers mount.
+ * This is critical because UserSystemProvider and ProjectProvider use React Query
+ * hooks that immediately make API calls on mount.
+ */
+function AuthGate() {
+  const { isAuthenticated } = useJwtAuth();
+
+  // If not authenticated, show login page immediately
+  // This prevents UserSystemProvider/ProjectProvider from mounting and making API calls
+  if (!isAuthenticated) {
+    return <LoginPage />;
+  }
+
+  // Only render the providers that make API calls AFTER authentication is confirmed
+  return (
+    <UserSystemProvider>
+      <ClickedElementsProvider>
+        <ProjectProvider>
+          <HotkeysProvider initiallyActiveScopes={['*', 'global', 'kanban']}>
+            <AppContent />
+          </HotkeysProvider>
+        </ProjectProvider>
+      </ClickedElementsProvider>
+    </UserSystemProvider>
+  );
+}
+
 function AppContent() {
+  // Track previous path for back navigation
+  usePreviousPath();
+
+  return <AuthenticatedApp />;
+}
+
+function AuthenticatedApp() {
   const { config, analyticsUserId, updateAndSaveConfig } = useUserSystem();
   const posthog = usePostHog();
   const { isSignedIn } = useAuth();
-
-  // Track previous path for back navigation
-  usePreviousPath();
 
   // Handle opt-in/opt-out and user identification when config loads
   useEffect(() => {
@@ -207,15 +241,9 @@ function AppContent() {
 function App() {
   return (
     <BrowserRouter>
-      <UserSystemProvider>
-        <ClickedElementsProvider>
-          <ProjectProvider>
-            <HotkeysProvider initiallyActiveScopes={['*', 'global', 'kanban']}>
-              <AppContent />
-            </HotkeysProvider>
-          </ProjectProvider>
-        </ClickedElementsProvider>
-      </UserSystemProvider>
+      <AuthProvider>
+        <AuthGate />
+      </AuthProvider>
     </BrowserRouter>
   );
 }
